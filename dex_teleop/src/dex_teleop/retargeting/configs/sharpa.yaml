@@ -48,6 +48,11 @@ retarget:
     y: 0.0
     z: 0.0
 
+  # Low-pass filter coefficient (0~1, smaller=smoother), applied per 1/lp_reference_hz
+  # seconds of capture time so the smoothing does not change with the retarget rate
+  lp_alpha: 0.2
+  lp_reference_hz: 60.0
+
 render:
   camera:
     azimuth: 135

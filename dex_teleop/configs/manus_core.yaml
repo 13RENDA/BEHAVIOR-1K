@@ -1,0 +1,115 @@
+# launch_og.py preset: MANUS gloves + VIVE Tracker Ultimate, entirely on this
+# Linux host through the MANUS Core 3.2 Python SDK (the default preset).
+#
+# No Windows machine and no C++ build are involved:
+#   - MANUS Core 3.2 SDK runs *Integrated* in a pure-Python sidecar
+#     (dex_teleop.tracking.manus_python_bridge) that talks to the glove dongle
+#     directly and streams the raw skeleton.
+#   - VIVE Hub for Linux (HTC beta, Sept 2026) pairs the Ultimate, builds its
+#     tracking map and publishes poses on /tmp/vut.sock; the sidecar reads
+#     them, injects them into MANUS as the right-hand tracker and composes the
+#     tracker-driven global wrist, so one raw-skeleton callback still carries
+#     both the finger articulation and the wrist.
+#
+# Keys are launch_og.py option names with the leading dashes removed
+# (--manus-tracker-feed -> manus_tracker_feed). A key set to null keeps the
+# built-in default. Anything given on the command line overrides this file.
+# Select a different preset with --config <name|path>, or --no-config.
+#
+#   python dex_teleop/scripts/launch_og.py --task arat_grasp_block_10cm
+#
+# Setup, calibration and acceptance checks:
+# docs/manus-linux-vive-ultimate-runbook.md
+# (the historical Windows Core path is kept in docs/manus-remote-vive-ultimate-runbook.md)
+
+# --- Tracking sources ------------------------------------------------------
+hand_source: manus        # finger articulation from the glove
+wrist_source: manus       # global wrist from the Ultimate, through the MANUS sidecar
+hand: right
+
+# --- MANUS Core 3.2 Python SDK (Integrated, Linux) -------------------------
+manus_backend: python                    # pure-Python sidecar; 'native' = legacy C++ bridge
+manus_mode: integrated                   # no MANUS Core application, no Windows host
+manus_sdk_root: ~/manus_setup/vendor/ManusSDK_v3.2.1   # extracted MANUS_Core_3.2.1_SDK_Linux.tar.gz
+# (The raw-skeleton hand motion is derived: tracker whenever MANUS supplies the
+# wrist, auto otherwise.)
+
+# --- VIVE Tracker Ultimate via VIVE Hub for Linux ---------------------------
+manus_tracker_feed: vive_ultimate        # read the Ultimate from VIVE Hub's tracker_server
+vive_ultimate_socket: /tmp/vut.sock      # VIVE Hub for Linux; the SDK demo server uses /tmp/vive_tracker.sock
+vive_ultimate_frame: x_right_y_up_z_back # VIVE Hub reports OpenXR axes; use x_forward_z_up for HTC's standalone SDK server
+manus_wrist_composition: bridge          # the sidecar places the wrist from the injected tracker itself
+# Tracker origin -> wrist joint offset in the tracker frame (meters, xyzw). The
+# default is the MANUS Universal Mount's documented example tracker-to-casing
+# offset mirrored for the right hand; replace with the values of MANUS Core's
+# "HTC Vive Ultimate Tracker" preset for your mount (Core Dashboard > profile
+# > hand offsets > Save to XML) once measured.
+manus_tracker_to_wrist_translation: null       # e.g. "-0.003,-0.058,-0.043"
+manus_tracker_to_wrist_rotation_xyzw: null     # e.g. "0,0,0,1"
+manus_tracker_to_casing_translation: null      # same offset, sent to Core as RightHandTrackerToCasing
+manus_tracker_to_casing_rotation_xyzw: null
+
+# Required for the MANUS wrist role: the Ultimate's serial as VIVE Hub lists
+# it (also the "Add" name on the tracker socket). The launcher refuses to
+# start while it is null, so fill it in once for this rig.
+manus_expected_tracker_id: "59-A33R03250"   # VIVE Ultimate Tracker 1, mounted on the right glove
+# With the Linux feed the tracker is assigned to the Core user that owns the
+# right glove automatically; set an explicit user id only to pin it.
+manus_expected_tracker_user_id: null
+
+# Optional measured Core-world -> robot-frame JSON. null uses the built-in
+# default: Core's Y-up world rotated into the launcher's Z-up tracking frame,
+# no wrist residual. Position and yaw are anchored at engagement exactly like
+# the Quest wrist, so face the robot's +X when VIVE Hub builds the map (or
+# correct with tracking_yaw_deg). Provide a file only when recorded MANUS
+# wrist poses must sit in a surveyed robot frame.
+manus_core_calibration: null        # e.g. configs/manus-core-right.json
+
+# Optional wearer .mcal. Create it on Linux with the MANUS Core Dashboard
+# (Linux build) from the SDK package in integrated mode, or reuse one from a
+# Windows Core; it is pushed through CoreSdk_SetGloveCalibration at start.
+manus_calibration: null             # e.g. ~/manus_setup/calibration/right.mcal
+
+manus_tracker_diagnostics: true     # Ultimate ID/role/quality monitoring (mandatory for the wrist role)
+# VIVE Hub streams at ~90 Hz; the watchdog fails wrist control when the
+# selected tracker stops updating or loses tracking for longer than this.
+manus_tracker_stale_timeout: 1.0    # seconds
+manus_startup_timeout: 35.0
+manus_connect_timeout: 15
+manus_glove_timeout: 15
+manus_reconnect_timeout: 15
+manus_discovery_wait: 1
+
+# --- Haptics (Metaglove Pro Haptic) ----------------------------------------
+# Per-finger vibration from simulated contact forces on the Sharpa hand, in
+# the Isaac Teleop haptic-sink contract (thumb..pinky amplitudes). Enable once
+# the glove is a Metaglove Pro Haptic; a non-haptic glove ignores the commands.
+manus_haptics: false
+manus_haptics_min_force: 0.5        # N: contact force that starts vibration
+manus_haptics_max_force: 6.0        # N: contact force at full amplitude
+manus_haptics_min_amplitude: 0.15   # amplitude floor while touching
+manus_haptics_smoothing: 0.5        # decay smoothing per update (1 = none)
+manus_haptics_rate: 30.0            # Hz: maximum command rate to the glove
+
+# --- Retargeting and control -----------------------------------------------
+retargeter: adaptive                # or dexpilot (pip install -e './dex_teleop[dexpilot]')
+maximum_source_skew: 0.05           # unused for MANUS/MANUS: both components share one callback
+maximum_frame_age: 0.25
+stale_frame_policy: error           # or hold
+initial_frame_timeout: 10.0
+position_sensitivity: 1.5
+tracking_yaw_deg: 0.0               # residual yaw between the VIVE Hub map's forward and the robot's +X
+
+# --- Recording -------------------------------------------------------------
+# SPACE engages teleoperation and starts recording; R ends the episode and
+# starts the next after a reset; Ctrl+C finalizes the file.
+record_hand_poses: true             # native-rate MANUS streams + provenance in the task HDF5
+# recording_path: dex_teleop/outputs/recordings/session_01.hdf5   # single --task only
+# record_hand_source: [quest]       # comparison-only Quest articulation (needs the HTS app)
+# record_wrist_source: [quest]
+
+# --- OYMotion EMG (optional) -----------------------------------------------
+# emg: true
+# emg_device: D8:71:4D:8D:99:92
+# emg_adapter: hci1
+# emg_notch: "60"

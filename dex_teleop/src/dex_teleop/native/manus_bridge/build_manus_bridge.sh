@@ -6,6 +6,11 @@ readonly sdk_types_sha256="f20bfe782e043c8aaa2f7e89eee6df6b701ecb7711150f7ab3d7a
 readonly sdk_initializers_sha256="4e9c6607138ece3351eaf072634920ba1b16bde89483151c50700713745062e9"
 readonly sdk_remote_sha256="91b42c423e36031c7bade01964c341c9f9423b28aeadd300056792d982c0ccaf"
 readonly sdk_integrated_sha256="0e67141b97b64c089c3bbdab47980ca9822c4de19adea810a2f68722adcb3fe3"
+readonly sdk_v3_2_1_header_sha256="e24a4b8d8b53401c6512acb46af821bbdbd9eda4a9e2ba760b0cbd61aa9d3e53"
+readonly sdk_v3_2_1_types_sha256="e170c5ca419913f829d9ba68b21fc2696ab3bac4e43c6dd8b258d7c6045793be"
+readonly sdk_v3_2_1_initializers_sha256="93b9ad8bc339ec1456fd3a9abccf4b2af42329b52eb9bfac492054f57e908122"
+readonly sdk_v3_2_1_amd64_sha256="0d8ec3bfeaec7658ea4d5ff41bad4e14260ed01a5c96099dcd8235bcb2b1357f"
+readonly sdk_v3_2_1_aarch64_sha256="fd1722a0af94e632a51628dbaa1e748a1619b0e6b733326d4a245421cd6ef780"
 readonly bundle_marker_name=".dex-teleop-manus-bridge-bundle"
 readonly bundle_kind="dex_teleop_manus_bridge_bundle"
 readonly bundle_schema="1"
@@ -24,10 +29,13 @@ Options:
   --runtime-prefix PATH
   --allow-owned-runtime-prefix-outside-cache
 
-Integrated is the backwards-compatible default. Remote requires the strictly
-validated runtime produced by build_manus_remote_runtime.sh. MANUS_SDK_ROOT,
-DEX_TELEOP_MANUS_BRIDGE_OUTPUT, and DEX_TELEOP_MANUS_REMOTE_RUNTIME provide
-equivalent defaults. The Remote runtime prefix is ignored by Integrated.
+Integrated is the backwards-compatible default. The SDK must be the official
+v3.1.1 or v3.2.1 package; match the version of the Windows MANUS Core used in
+Remote mode. Remote with SDK v3.1.1 requires the strictly validated runtime
+produced by build_manus_remote_runtime.sh; SDK v3.2.1 links gRPC statically
+and needs no separate runtime. MANUS_SDK_ROOT, DEX_TELEOP_MANUS_BRIDGE_OUTPUT,
+and DEX_TELEOP_MANUS_REMOTE_RUNTIME provide equivalent defaults. The Remote
+runtime prefix is ignored by Integrated and by SDK v3.2.1.
 EOF
 }
 
@@ -84,12 +92,27 @@ case "$mode" in
         ;;
 esac
 
-for tool in awk cp find g++ ldd mktemp readelf readlink realpath sha256sum wc; do
+for tool in awk cp find g++ ldd mktemp readelf readlink realpath sha256sum uname wc; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Required bridge build tool is unavailable: $tool" >&2
         exit 3
     fi
 done
+
+case "$(uname -m)" in
+    x86_64|amd64)
+        sdk_v3_2_1_library="lib/amd64/libManusSDK-amd64.so"
+        sdk_v3_2_1_library_sha256="$sdk_v3_2_1_amd64_sha256"
+        ;;
+    aarch64|arm64)
+        sdk_v3_2_1_library="lib/aarch64/libManusSDK-aarch64.so"
+        sdk_v3_2_1_library_sha256="$sdk_v3_2_1_aarch64_sha256"
+        ;;
+    *)
+        sdk_v3_2_1_library=""
+        sdk_v3_2_1_library_sha256=""
+        ;;
+esac
 
 if [[ -z "$output" ]]; then
     output="${XDG_CACHE_HOME:-${HOME}/.cache}/dex_teleop/manus_bridge/manus_bridge"
@@ -142,6 +165,36 @@ sdk_layout_is_v3_1_1() {
     [[ "$(file_sha256 "$candidate/lib/libManusSDK_Integrated.so")" == "$sdk_integrated_sha256" ]] || return 1
 }
 
+sdk_layout_is_v3_2_1() {
+    local candidate="$1"
+    [[ -n "$sdk_v3_2_1_library" ]] || return 1
+    [[ -f "$candidate/include/ManusSDK.h" ]] || return 1
+    [[ -f "$candidate/include/ManusSDKTypes.h" ]] || return 1
+    [[ -f "$candidate/include/ManusSDKTypeInitializers.h" ]] || return 1
+    [[ -f "$candidate/$sdk_v3_2_1_library" ]] || return 1
+    [[ "$(file_sha256 "$candidate/include/ManusSDK.h")" == "$sdk_v3_2_1_header_sha256" ]] || return 1
+    [[ "$(file_sha256 "$candidate/include/ManusSDKTypes.h")" == "$sdk_v3_2_1_types_sha256" ]] || return 1
+    [[ "$(file_sha256 "$candidate/include/ManusSDKTypeInitializers.h")" == "$sdk_v3_2_1_initializers_sha256" ]] || return 1
+    [[ "$(file_sha256 "$candidate/$sdk_v3_2_1_library")" == "$sdk_v3_2_1_library_sha256" ]] || return 1
+}
+
+# A previously published bridge may have been built against either supported
+# SDK release, so ownership accepts any fingerprint-verified library for $mode.
+sdk_library_is_verified() {
+    local library="$1"
+    local digest
+    [[ -f "$library" ]] || return 1
+    digest="$(file_sha256 "$library")"
+    if [[ -n "$sdk_v3_2_1_library_sha256" && "$digest" == "$sdk_v3_2_1_library_sha256" ]]; then
+        return 0
+    fi
+    if [[ "$mode" == "integrated" ]]; then
+        [[ "$digest" == "$sdk_integrated_sha256" ]]
+    else
+        [[ "$digest" == "$sdk_remote_sha256" ]]
+    fi
+}
+
 candidate_roots=()
 if [[ -n "$sdk_root" ]]; then
     candidate_roots+=("$(realpath -m -- "$sdk_root")")
@@ -154,6 +207,7 @@ candidate_roots+=(
 include_dir=""
 sdk_lib=""
 sdk_layout=""
+sdk_version=""
 searched=()
 for root in "${candidate_roots[@]}"; do
     [[ -d "$root" ]] || continue
@@ -162,16 +216,20 @@ for root in "${candidate_roots[@]}"; do
         "$root/ManusSDK"
         "$root/SDKClient_Linux/ManusSDK"
         "$root/SDKMinimalClient_Linux/ManusSDK"
+        "$root/C++/SDKClient/ManusSDK"
+        "$root/C++/SDKMinimalClient/ManusSDK"
     )
+    # Several installed releases resolve to the newest unless a root is explicit.
     while IFS= read -r found; do
         candidates+=("$found")
-    done < <(find "$root/vendor" -maxdepth 4 -type d -name ManusSDK 2>/dev/null | sort)
+    done < <(find "$root/vendor" -maxdepth 4 -type d -name ManusSDK 2>/dev/null | sort -rV)
 
     for candidate in "${candidates[@]}"; do
         candidate="$(realpath -m -- "$candidate")"
         searched+=("$candidate")
         if sdk_layout_is_v3_1_1 "$candidate"; then
             sdk_layout="$candidate"
+            sdk_version="3.1.1"
             include_dir="$candidate/include"
             if [[ "$mode" == "integrated" ]]; then
                 sdk_lib="$candidate/lib/libManusSDK_Integrated.so"
@@ -180,18 +238,25 @@ for root in "${candidate_roots[@]}"; do
             fi
             break 2
         fi
+        if sdk_layout_is_v3_2_1 "$candidate"; then
+            sdk_layout="$candidate"
+            sdk_version="3.2.1"
+            include_dir="$candidate/include"
+            sdk_lib="$candidate/$sdk_v3_2_1_library"
+            break 2
+        fi
     done
 done
 
 if [[ -z "$sdk_layout" ]]; then
-    echo "Could not find a fingerprint-verified MANUS SDK v3.1.1 layout." >&2
+    echo "Could not find a fingerprint-verified MANUS SDK v3.1.1 or v3.2.1 layout." >&2
     echo "Set MANUS_SDK_ROOT or pass --sdk-root. Searched:" >&2
     printf '  %s\n' "${searched[@]}" >&2
     exit 3
 fi
 
 remote_runtime_lib=""
-if [[ "$mode" == "remote" ]]; then
+if [[ "$mode" == "remote" && "$sdk_version" == "3.1.1" ]]; then
     runtime_command=(
         bash
         "$script_dir/build_manus_remote_runtime.sh"
@@ -211,7 +276,7 @@ if [[ "$mode" == "remote" ]]; then
     remote_runtime_lib="$remote_runtime_prefix/lib"
 fi
 
-if [[ "$mode" == "remote" ]]; then
+if [[ -n "$remote_runtime_lib" ]]; then
     vendor_ldd="$(env -u LD_PRELOAD LD_LIBRARY_PATH="$remote_runtime_lib" \
         ldd -r "$sdk_lib" 2>&1 || true)"
 else
@@ -219,7 +284,7 @@ else
 fi
 closure_pattern='not found|undefined symbol'
 if [[ "$vendor_ldd" =~ $closure_pattern ]]; then
-    echo "MANUS $mode SDK v3.1.1 failed load/relocation validation:" >&2
+    echo "MANUS $mode SDK v$sdk_version failed load/relocation validation:" >&2
     printf '%s\n' "$vendor_ldd" >&2
     exit 4
 fi
@@ -246,6 +311,7 @@ cat > "$staging_bundle/$bundle_marker_name" <<EOF
 kind=$bundle_kind
 schema=$bundle_schema
 mode=$mode
+sdk_version=$sdk_version
 sdk_library_sha256=$(file_sha256 "$sdk_lib")
 EOF
 
@@ -268,27 +334,27 @@ runtime_published=false
 executable_published=false
 publish_committed=false
 legacy_runtime_moved=false
-expected_sdk_library_sha256="$(file_sha256 "$sdk_lib")"
 
 bundle_is_owned() {
     local bundle="$1"
     local marker="$bundle/$bundle_marker_name"
+    local runtime_library
     [[ -f "$marker" ]] || return 1
     [[ "$(metadata_value kind "$marker")" == "$bundle_kind" ]] || return 1
     [[ "$(metadata_value schema "$marker")" == "$bundle_schema" ]] || return 1
     [[ "$(metadata_value mode "$marker")" == "$mode" ]] || return 1
-    [[ "$(metadata_value sdk_library_sha256 "$marker")" == \
-       "$expected_sdk_library_sha256" ]] || return 1
     [[ -L "$bundle/manus_runtime_${mode}/libManusSDK.so" ]] || return 1
-    [[ "$(readlink -f -- "$bundle/manus_runtime_${mode}/libManusSDK.so")" == \
-       "$sdk_lib" ]] || return 1
+    runtime_library="$(readlink -f -- "$bundle/manus_runtime_${mode}/libManusSDK.so")"
+    sdk_library_is_verified "$runtime_library" || return 1
+    [[ "$(metadata_value sdk_library_sha256 "$marker")" == \
+       "$(file_sha256 "$runtime_library")" ]] || return 1
 }
 
 legacy_runtime_is_owned() {
     local runtime="$1"
     [[ -d "$runtime" && ! -L "$runtime" ]] || return 1
     [[ -L "$runtime/libManusSDK.so" ]] || return 1
-    [[ "$(readlink -f -- "$runtime/libManusSDK.so")" == "$sdk_lib" ]] || return 1
+    sdk_library_is_verified "$(readlink -f -- "$runtime/libManusSDK.so")" || return 1
     local entry_count
     entry_count="$(find "$runtime" -mindepth 1 -maxdepth 1 -printf '.' | wc -c)"
     [[ "$entry_count" == "1" ]]
@@ -483,7 +549,7 @@ fi
 cxx="${CXX:-g++}"
 runtime_rpath="\$ORIGIN/manus_runtime_${mode}"
 remote_linker_args=()
-if [[ "$mode" == "remote" ]]; then
+if [[ -n "$remote_runtime_lib" ]]; then
     runtime_rpath="$runtime_rpath:$remote_runtime_lib"
     remote_linker_args+=("-Wl,-rpath-link,$remote_runtime_lib")
 fi
@@ -507,11 +573,17 @@ fi
 
 verify_bridge() {
     local bridge="$1"
+    local expected_rpath="${2:-}"
     local dynamic loader probe
     dynamic="$(readelf -d "$bridge")"
     [[ "$dynamic" == *"(RPATH)"* ]] || return 1
     [[ "$dynamic" != *"(RUNPATH)"* ]] || return 1
-    [[ "$dynamic" == *"Library rpath: [$runtime_rpath]"* ]] || return 1
+    if [[ -n "$expected_rpath" ]]; then
+        [[ "$dynamic" == *"Library rpath: [$expected_rpath]"* ]] || return 1
+    else
+        # A previously published SDK v3.1.1 Remote bridge also carries its runtime path.
+        [[ "$dynamic" == *"Library rpath: [\$ORIGIN/manus_runtime_${mode}"[]:]* ]] || return 1
+    fi
     loader="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd -r "$bridge" 2>&1 || true)"
     if [[ "$loader" =~ $closure_pattern ]]; then
         printf '%s\n' "$loader" >&2
@@ -521,7 +593,7 @@ verify_bridge() {
     [[ "$probe" == "dex_teleop.manus 2" ]] || return 1
 }
 
-if ! verify_bridge "$staged_output"; then
+if ! verify_bridge "$staged_output" "$runtime_rpath"; then
     echo "Staged MANUS $mode bridge failed RPATH, relocation, or protocol verification." >&2
     exit 5
 fi
@@ -625,7 +697,7 @@ maybe_fail_publication "after-runtime-publish"
 
 publish_executable="$output_parent/.${output_name}.publish.$$.$RANDOM"
 mv -- "$staged_output" "$publish_executable"
-if ! verify_bridge "$publish_executable"; then
+if ! verify_bridge "$publish_executable" "$runtime_rpath"; then
     echo "Published-path MANUS $mode bridge verification failed before replacement." >&2
     exit 5
 fi
@@ -634,7 +706,7 @@ publish_executable=""
 executable_published=true
 maybe_fail_publication "after-executable-publish"
 
-if ! verify_bridge "$output"; then
+if ! verify_bridge "$output" "$runtime_rpath"; then
     echo "Published MANUS $mode bridge failed final verification." >&2
     exit 5
 fi
@@ -661,9 +733,9 @@ echo "Built and transactionally published MANUS bridge: $output"
 echo "Bridge bundle: $published_bundle"
 echo "Bridge SHA-256: $artifact_sha256"
 echo "Bridge mode: $mode"
-echo "Verified SDK layout: $sdk_layout"
+echo "Verified SDK v$sdk_version layout: $sdk_layout"
 echo "SDK library: $sdk_lib"
-if [[ "$mode" == "remote" ]]; then
+if [[ -n "$remote_runtime_lib" ]]; then
     echo "Strictly verified Remote runtime: $remote_runtime_prefix"
 fi
 env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd -r "$output"

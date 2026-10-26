@@ -10,8 +10,21 @@ import time
 
 import numpy as np
 
-from dex_teleop.tracking.manus import ManusSource
+from dex_teleop.tracking.manus import (
+    MANUS_BACKENDS,
+    MANUS_TRACKER_FEEDS,
+    MANUS_ULTIMATE_TRACKER_SYSTEM,
+    MANUS_WRIST_COMPOSITIONS,
+    ManusSource,
+)
 from dex_teleop.tracking.manus_calibration import ManusCoreCalibration
+from dex_teleop.tracking.transforms import RigidTransform
+from dex_teleop.tracking.vive_ultimate import (
+    VUT_DEFAULT_FRAME,
+    VUT_DEFAULT_SOCKET,
+    VUT_FRAMES,
+    VUT_TRACKING_SYSTEM,
+)
 from dex_teleop.types import Handedness
 
 
@@ -22,7 +35,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--duration", type=float, default=10.0)
     parser.add_argument("--hand", choices=("left", "right"), default="right")
-    parser.add_argument("--mode", choices=("integrated", "remote"), default="remote")
+    parser.add_argument(
+        "--mode",
+        choices=("integrated", "remote"),
+        default="integrated",
+        help="integrated: embedded Core on this Linux host (default); remote: MANUS Core on Windows",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=MANUS_BACKENDS,
+        default=None,
+        help=(
+            "python: MANUS Core 3.2 Python SDK sidecar (default); native: legacy C++ bridge "
+            "(implied by --bridge)"
+        ),
+    )
     parser.add_argument(
         "--core-host", help="Exact Core IP/name or sorted discovery index"
     )
@@ -30,10 +57,26 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hand-motion",
         choices=("auto", "tracker", "tracker_rotation_only", "imu", "none"),
-        help="Default: tracker for Remote, auto for Integrated",
+        help="Default: tracker for Remote or a tracker feed, auto otherwise",
+    )
+    parser.add_argument(
+        "--tracker-feed",
+        choices=MANUS_TRACKER_FEEDS,
+        default="none",
+        help="Integrated: vive_ultimate reads the Ultimate from VIVE Hub for Linux",
+    )
+    parser.add_argument("--vive-ultimate-socket", default=VUT_DEFAULT_SOCKET)
+    parser.add_argument("--vive-ultimate-frame", choices=VUT_FRAMES, default=VUT_DEFAULT_FRAME)
+    parser.add_argument("--wrist-composition", choices=MANUS_WRIST_COMPOSITIONS, default="bridge")
+    parser.add_argument(
+        "--tracker-to-wrist",
+        type=float,
+        nargs=7,
+        metavar=("X", "Y", "Z", "QX", "QY", "QZ", "QW"),
+        help="Tracker origin to wrist joint offset for bridge composition",
     )
     parser.add_argument("--sdk-root")
-    parser.add_argument("--bridge")
+    parser.add_argument("--bridge", help="Native C++ bridge executable (--backend native)")
     parser.add_argument("--glove-calibration")
     parser.add_argument("--core-calibration")
     parser.add_argument("--settings-dir")
@@ -147,12 +190,22 @@ def main(arguments: list[str] | None = None) -> int:
         )
     if args.mode == "integrated" and args.core_host is not None:
         raise SystemExit("--core-host requires --mode remote")
+    if args.backend is None:
+        args.backend = "native" if args.bridge is not None else "python"
+    if args.tracker_feed != "none" and args.mode != "integrated":
+        raise SystemExit("--tracker-feed requires --mode integrated")
+    if args.tracker_feed != "none" and args.backend != "python":
+        raise SystemExit("--tracker-feed requires --backend python")
+    if args.bridge is not None and args.backend != "native":
+        raise SystemExit("--bridge names a C++ sidecar and requires --backend native")
     if not math.isfinite(args.tracker_stale_timeout) or args.tracker_stale_timeout <= 0:
         raise SystemExit("--tracker-stale-timeout must be positive and finite")
 
     expected_tracker_id = args.expected_tracker_id
     expected_tracker_type = f"{args.hand}_hand"
-    expected_tracker_system = "openvr"
+    expected_tracker_system = (
+        VUT_TRACKING_SYSTEM if args.tracker_feed == "vive_ultimate" else MANUS_ULTIMATE_TRACKER_SYSTEM
+    )
     expected_tracker_user_id = args.expected_tracker_user_id
     if args.core_calibration is not None:
         try:
@@ -172,27 +225,41 @@ def main(arguments: list[str] | None = None) -> int:
     require_validated_tracker = (
         args.require_tracker_motion or args.require_trackable_tracker
     )
-    if require_validated_tracker and (
-        expected_tracker_id is None or expected_tracker_user_id is None
+    if require_validated_tracker and expected_tracker_id is None:
+        raise SystemExit("Tracker acceptance requires --expected-tracker-id")
+    if (
+        require_validated_tracker
+        and expected_tracker_user_id is None
+        and args.tracker_feed == "none"
     ):
         raise SystemExit(
-            "Tracker acceptance requires --expected-tracker-id and "
-            "--expected-tracker-user-id"
+            "Tracker acceptance requires --expected-tracker-user-id "
+            "(with --tracker-feed vive_ultimate the glove owner is resolved automatically)"
         )
     if expected_tracker_user_id is not None and expected_tracker_user_id < 0:
         raise SystemExit("--expected-tracker-user-id must be non-negative")
+    if require_validated_tracker and args.core_calibration is None:
+        core_calibration = ManusCoreCalibration.default()
+    else:
+        core_calibration = args.core_calibration
+    tracker_to_wrist = (
+        None
+        if args.tracker_to_wrist is None
+        else RigidTransform(args.tracker_to_wrist[:3], args.tracker_to_wrist[3:])
+    )
 
     calibration_argument = {f"{args.hand}_calibration": args.glove_calibration}
     source = ManusSource(
         bridge_executable=args.bridge,
         sdk_root=args.sdk_root,
+        backend=args.backend,
         mode=args.mode,
         core_host=args.core_host,
         loopback_only=args.loopback_only,
         hand_motion=(
             args.hand_motion
             if args.hand_motion is not None
-            else ("tracker" if args.mode == "remote" else "auto")
+            else ("tracker" if args.mode == "remote" or args.tracker_feed != "none" else "auto")
         ),
         tracker_diagnostics=True,
         startup_timeout=args.startup_timeout,
@@ -202,13 +269,18 @@ def main(arguments: list[str] | None = None) -> int:
         discovery_wait=args.discovery_wait,
         settings_dir=args.settings_dir,
         log_dir=args.log_dir,
-        core_calibration=args.core_calibration,
+        core_calibration=core_calibration,
         required_handedness=args.hand,
         max_pending_samples=max(256, math.ceil(args.duration * 240.0)),
         require_tracker_for_wrist=require_validated_tracker,
         tracker_stale_timeout=args.tracker_stale_timeout,
         expected_tracker_id=expected_tracker_id,
         expected_tracker_user_id=expected_tracker_user_id,
+        tracker_feed=args.tracker_feed,
+        vive_ultimate_socket=args.vive_ultimate_socket,
+        vive_ultimate_frame=args.vive_ultimate_frame,
+        wrist_composition=args.wrist_composition,
+        tracker_to_wrist=tracker_to_wrist,
         **calibration_argument,
     )
     output = args.output.expanduser()

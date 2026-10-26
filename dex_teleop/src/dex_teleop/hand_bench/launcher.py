@@ -15,6 +15,7 @@ OYMotion wristband under ``/emg`` with per-action ``/synchronization`` ranges.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import logging
 import math
 import os
@@ -47,13 +48,14 @@ from dex_teleop.omnigibson.launcher import (
     _configure_camera_layout,
     _file_fingerprint,
     _finalize_recording,
+    _freeze_loaded_heap,
     _show_robot_end_effectors,
     _shutdown_omnigibson,
     _window_name,
     recording_staging_path,
 )
 from dex_teleop.retargeting import SUPPORTED_RETARGETERS, create_hand_retargeter
-from dex_teleop.runtime import MultiSourceTrackingWorker
+from dex_teleop.runtime import MultiSourceTrackingWorker, ProcessTrackingWorker
 from dex_teleop.tracking import (
     FIXED_WRIST_SOURCE_NAME,
     FixedWristSource,
@@ -62,15 +64,17 @@ from dex_teleop.tracking import (
     SourceUnavailableError,
 )
 from dex_teleop.tracking.manus import (
+    MANUS_BACKENDS,
     ManusIntegratedSource,
     default_manus_bridge_path,
+    discover_manus_python_sdk,
     discover_manus_sdk,
 )
 from dex_teleop.types import Handedness
 
 
 LOGGER = logging.getLogger(__name__)
-HAND_SOURCES = ("quest", "hts", "manus")
+HAND_SOURCES = ("quest", "manus")
 HAND_MODEL = "sharpa"
 HAND_SIDE = "right"
 SCREENSHOT_SETTLE_FRAMES = 90
@@ -82,16 +86,12 @@ DEFAULT_RECORDING_ROOT = Path(__file__).resolve().parents[3] / "outputs" / "reco
 # They are rejected up front with an explanation instead of argparse's generic
 # "unrecognized arguments" message.
 REJECTED_WRIST_OPTIONS = (
-    "--source",
     "--wrist-source",
     "--record-wrist-source",
     "--record-hand-source",
-    "--vive-calibration",
     "--articulation-wrist-calibration",
-    "--auto-anchor",
     "--position-sensitivity",
     "--tracking-yaw-deg",
-    "--manus-hand-motion",
     "--manus-core-calibration",
     "--manus-expected-tracker-id",
     "--manus-expected-tracker-user-id",
@@ -99,10 +99,6 @@ REJECTED_WRIST_OPTIONS = (
     "--no-manus-tracker-diagnostics",
     "--manus-tracker-stale-timeout",
 )
-
-
-def _canonical_hand_source(name: str) -> str:
-    return "quest" if name in {"quest", "hts"} else name
 
 
 def reject_wrist_options(argv: list[str]) -> None:
@@ -121,7 +117,7 @@ def reject_wrist_options(argv: list[str]) -> None:
             "The hand bench disables wrist tracking; not accepted: "
             + ", ".join(offending)
             + ". Only finger tracking is configurable: "
-            "--hand-source quest|hts|manus (plus the HTS network and MANUS glove options)."
+            "--hand-source quest|manus (plus the HTS network and MANUS glove options)."
         )
 
 
@@ -131,9 +127,21 @@ def _parser() -> argparse.ArgumentParser:
         "--hand-source",
         choices=HAND_SOURCES,
         default="quest",
-        help="Finger articulation provider (quest and hts are aliases for Quest HTS; default: quest)",
+        help="Finger articulation provider (quest is the Quest Hand Tracking Streamer; default: quest)",
     )
     parser.add_argument("--retargeter", choices=SUPPORTED_RETARGETERS, default="adaptive")
+    parser.add_argument(
+        "--tracking-process",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Parse, fuse, and retarget hand tracking in a child process so it cannot slow the simulator",
+    )
+    parser.add_argument(
+        "--retarget-once-per-step",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Retarget only the newest frame, at most once per simulator step, instead of every frame",
+    )
     parser.add_argument(
         "--finger-target-scale",
         type=float,
@@ -149,6 +157,12 @@ def _parser() -> argparse.ArgumentParser:
         help="MANUS install/discovery root; the bridge also searches ~/manus_setup",
     )
     parser.add_argument(
+        "--manus-backend",
+        choices=MANUS_BACKENDS,
+        default="python",
+        help="python: MANUS Core 3.2 Python SDK sidecar (default); native: legacy C++ bridge",
+    )
+    parser.add_argument(
         "--manus-mode",
         choices=("integrated", "remote"),
         default="integrated",
@@ -156,7 +170,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--manus-core-host", help="Remote Core selector: IP, exact name, or sorted index")
     parser.add_argument("--manus-loopback-only", action="store_true")
-    parser.add_argument("--manus-bridge", help="Pre-built matching MANUS bridge executable")
+    parser.add_argument("--manus-bridge", help="Pre-built matching MANUS C++ bridge executable (--manus-backend native)")
     parser.add_argument("--manus-calibration", help="MANUS .mcal file for the right glove")
     parser.add_argument("--manus-settings-dir", help="Writable MANUS SDK settings directory")
     parser.add_argument("--manus-log-dir", help="Writable MANUS SDK log directory")
@@ -315,7 +329,7 @@ def _validate_args(args) -> None:
         or args.manus_discovery_wait <= 0
     ):
         raise SystemExit("MANUS timeouts are invalid")
-    manus_selected = _canonical_hand_source(args.hand_source) == "manus"
+    manus_selected = args.hand_source == "manus"
     manus_only = (
         args.manus_bridge,
         args.manus_calibration,
@@ -384,13 +398,14 @@ def _force_data_path() -> Path:
 def create_articulation_source(args):
     """Construct the selected finger-tracking receiver (never a wrist provider)."""
 
-    source = _canonical_hand_source(args.hand_source)
+    source = args.hand_source
     if source == "quest":
         return HTSSource(host=args.host, port=args.port, protocol=args.protocol)
     if source == "manus":
         return ManusIntegratedSource(
             bridge_executable=args.manus_bridge,
             sdk_root=args.manus_sdk_root,
+            backend=args.manus_backend,
             mode=args.manus_mode,
             core_host=args.manus_core_host,
             loopback_only=args.manus_loopback_only,
@@ -411,7 +426,7 @@ def create_articulation_source(args):
 def create_worker(args, articulation_source=None) -> MultiSourceTrackingWorker:
     """Fuse the finger source with a fixed wrist and the selected Sharpa retargeter."""
 
-    source_key = _canonical_hand_source(args.hand_source)
+    source_key = args.hand_source
     inner = create_articulation_source(args) if articulation_source is None else articulation_source
     fixed = FixedWristSource(inner)
     retargeter = create_hand_retargeter(args.retargeter, "sharpa", hand_side="right")
@@ -423,6 +438,7 @@ def create_worker(args, articulation_source=None) -> MultiSourceTrackingWorker:
         handedness=Handedness.RIGHT,
         fuser=HandObservationFuser(interpolate_wrist=False),
         retargeter_name=args.retargeter,
+        retarget_once_per_snapshot=args.retarget_once_per_step,
     )
 
 
@@ -551,13 +567,27 @@ def create_emg_session(args, recording_path: Path) -> EmgSession:
     )
 
 
-def set_recording_metadata(session: HandTrackingRecordingSession, worker: MultiSourceTrackingWorker, args) -> None:
+def _fixed_wrist_metadata(worker: MultiSourceTrackingWorker) -> dict[str, object]:
+    fixed_source = worker.sources[worker.articulation_source]
+    if not isinstance(fixed_source, FixedWristSource):
+        raise TypeError("The hand bench worker must wrap its finger source in FixedWristSource")
+    recording_metadata = getattr(fixed_source.articulation_source, "recording_metadata", None)
+    return {
+        "articulation": recording_metadata() if callable(recording_metadata) else None,
+        "position": fixed_source.position.tolist(),
+        "quaternion_xyzw": fixed_source.quaternion_xyzw.tolist(),
+    }
+
+
+def set_recording_metadata(
+    session: HandTrackingRecordingSession,
+    worker: MultiSourceTrackingWorker | ProcessTrackingWorker,
+    args,
+) -> None:
     """Attach provenance for the finger source, the fixed wrist, and the retargeter."""
 
     source_key = worker.articulation_source
-    fixed_source = worker.sources[source_key]
-    if not isinstance(fixed_source, FixedWristSource):
-        raise TypeError("The hand bench worker must wrap its finger source in FixedWristSource")
+    fixed = worker.query(_fixed_wrist_metadata)
     articulation: dict[str, object] = {"registry_key": source_key}
     if source_key == "quest":
         articulation.update(
@@ -567,16 +597,27 @@ def set_recording_metadata(session: HandTrackingRecordingSession, worker: MultiS
             }
         )
     elif source_key == "manus":
-        try:
-            resolved_sdk_root = str(discover_manus_sdk(args.manus_sdk_root, mode=args.manus_mode).root)
-        except SourceUnavailableError:
-            resolved_sdk_root = "unavailable"
+        if args.manus_backend == "python":
+            from dex_teleop.tracking import manus_python_bridge
+
+            try:
+                resolved_sdk_root = str(discover_manus_python_sdk(args.manus_sdk_root))
+            except SourceUnavailableError:
+                resolved_sdk_root = "installed manus_sdk package or unavailable"
+            bridge = _file_fingerprint(manus_python_bridge.__file__)
+        else:
+            try:
+                resolved_sdk_root = str(discover_manus_sdk(args.manus_sdk_root, mode=args.manus_mode).root)
+            except SourceUnavailableError:
+                resolved_sdk_root = "unavailable"
+            bridge = _file_fingerprint(args.manus_bridge or default_manus_bridge_path(args.manus_mode))
         articulation.update(
             {
-                **fixed_source.articulation_source.recording_metadata(),
+                **fixed["articulation"],
+                "backend": args.manus_backend,
                 "requested_sdk_root": str(Path(args.manus_sdk_root).expanduser()),
                 "resolved_sdk_root": resolved_sdk_root,
-                "bridge": _file_fingerprint(args.manus_bridge or default_manus_bridge_path(args.manus_mode)),
+                "bridge": bridge,
                 "glove_calibration": _file_fingerprint(args.manus_calibration),
             }
         )
@@ -587,8 +628,8 @@ def set_recording_metadata(session: HandTrackingRecordingSession, worker: MultiS
             "registry_key": worker.wrist_source,
             "provider": "FixedWristSource: wrist held by the simulator, device wrist discarded",
             "articulation_source": source_key,
-            "position": fixed_source.position.tolist(),
-            "quaternion_xyzw": fixed_source.quaternion_xyzw.tolist(),
+            "position": fixed["position"],
+            "quaternion_xyzw": fixed["quaternion_xyzw"],
         },
     )
     session.set_stream_metadata(
@@ -650,7 +691,7 @@ def _create_emg_monitor(env, emg_session: EmgSession, args):
 def run_bench(
     scene: HandBenchScene,
     args,
-    worker: MultiSourceTrackingWorker | None,
+    worker: MultiSourceTrackingWorker | ProcessTrackingWorker | None,
     shutdown: GracefulShutdown,
     *,
     recording_path: Path | None = None,
@@ -734,6 +775,9 @@ def run_bench(
     if table is None:
         raise RuntimeError("Hand bench scene did not load its table")
     _hold_reset_pose(robot, reset_positions)
+    # Its one full collection pauses tracking delivery; the warm-up steps let
+    # fresh frames arrive before the first live action checks their age.
+    _freeze_loaded_heap()
     for _ in range(10):
         og.sim.step()
     _show_robot_end_effectors(robot)
@@ -765,7 +809,7 @@ def run_bench(
     try:
         if emg_session is not None:
             emg_monitor = _create_emg_monitor(env, emg_session, args)
-        source_label = _canonical_hand_source(args.hand_source)
+        source_label = args.hand_source
         adapter = SharpaFingerActionAdapter(
             robot,
             config=SharpaFingerAdapterConfig(control_hz=30.0, finger_target_scale=args.finger_target_scale),
@@ -1006,7 +1050,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"device: {emg_session.metadata.get('decoder_device', 'unknown')}"
                 )
         if tracking_enabled:
-            worker = create_worker(args)
+            worker = ProcessTrackingWorker(partial(create_worker, args)) if args.tracking_process else create_worker(args)
             worker.start()
         run_bench(scene, args, worker, shutdown, recording_path=recording_path, emg_session=emg_session)
     except KeyboardInterrupt:

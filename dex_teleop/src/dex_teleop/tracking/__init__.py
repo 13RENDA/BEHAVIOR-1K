@@ -13,6 +13,7 @@ from dex_teleop.tracking.manus import (
     ManusProtocolError,
     ManusSource,
     build_manus_bridge,
+    discover_manus_python_sdk,
     discover_manus_sdk,
 )
 from dex_teleop.tracking.manus_calibration import (
@@ -37,7 +38,8 @@ from dex_teleop.tracking.openxr import (
     observation_to_hand_frame,
     openxr26_to_mediapipe21,
 )
-from dex_teleop.tracking.vive import RigidTransform, ViveCalibration, ViveWristSource
+from dex_teleop.tracking.transforms import RigidTransform
+from dex_teleop.tracking.vive_ultimate import VutIpcClient, VutPoseFeed, VutTrackerPose
 
 __all__ = [
     "HTSSource",
@@ -61,11 +63,13 @@ __all__ = [
     "MultimodalHandTrackingSource",
     "SourceUnavailableError",
     "RigidTransform",
-    "ViveCalibration",
-    "ViveWristSource",
+    "VutIpcClient",
+    "VutPoseFeed",
+    "VutTrackerPose",
     "WristPoseSource",
     "articulation_to_mediapipe21",
     "build_manus_bridge",
+    "discover_manus_python_sdk",
     "discover_manus_sdk",
     "hand_frame_to_articulation",
     "hand_frame_to_wrist",

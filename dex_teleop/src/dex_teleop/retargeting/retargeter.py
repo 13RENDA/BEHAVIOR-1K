@@ -50,7 +50,10 @@ class LandmarkRetargeter:
         alpha = float(self.config.get("retarget", {}).get("lp_alpha", 0.2))
         if not 0.0 < alpha <= 1.0:
             raise ValueError(f"retarget.lp_alpha must be in (0, 1], got {alpha}")
-        self.filter = LPFilter(alpha)
+        reference_hz = float(self.config.get("retarget", {}).get("lp_reference_hz", 60.0))
+        if not 0.0 < reference_hz < float("inf"):
+            raise ValueError(f"retarget.lp_reference_hz must be positive and finite, got {reference_hz}")
+        self.filter = LPFilter(alpha, reference_period=1.0 / reference_hz)
         self.rotation_xyz = self.config.get("retarget", {}).get("mediapipe_rotation", {})
         self.joint_names = tuple(self.optimizer.robot.dof_joint_names)
         if len(self.joint_names) != self.hand_profile.degrees_of_freedom:
@@ -73,7 +76,9 @@ class LandmarkRetargeter:
             raise ValueError(
                 f"Retargeter is configured for {self.hand_side}, received {frame.handedness.value} frame"
             )
-        positions = self.retarget_landmarks(frame.mediapipe_landmarks(), apply_filter=apply_filter)
+        positions = self.retarget_landmarks(
+            frame.mediapipe_landmarks(), apply_filter=apply_filter, timestamp=frame.timestamp
+        )
         command = RetargetedHandCommand(
             timestamp=frame.timestamp,
             handedness=frame.handedness,
@@ -84,7 +89,9 @@ class LandmarkRetargeter:
         self.hand_profile.validate(command)
         return command
 
-    def retarget_landmarks(self, landmarks: np.ndarray, apply_filter: bool = True) -> np.ndarray:
+    def retarget_landmarks(
+        self, landmarks: np.ndarray, apply_filter: bool = True, timestamp: float | None = None
+    ) -> np.ndarray:
         landmarks = np.asarray(landmarks, dtype=np.float64)
         if landmarks.shape != (21, 3):
             raise ValueError(f"Expected landmarks with shape (21, 3), got {landmarks.shape}")
@@ -93,7 +100,7 @@ class LandmarkRetargeter:
             angles = [float(self.rotation_xyz.get(axis, 0.0)) for axis in "xyz"]
             transformed = transformed @ Rotation.from_euler("xyz", angles, degrees=True).as_matrix().T
         positions = self.optimizer.solve(transformed)
-        return self.filter.next(positions) if apply_filter else positions
+        return self.filter.next(positions, timestamp) if apply_filter else positions
 
     def reset(self) -> None:
         self.filter.reset()

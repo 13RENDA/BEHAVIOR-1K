@@ -127,27 +127,45 @@ class TimingStats:
 class LPFilter:
     """Low-pass filter for smoothing joint positions."""
 
-    def __init__(self, alpha: float):
+    def __init__(self, alpha: float, reference_period: float | None = None):
         """Initialize filter.
 
         Args:
             alpha: Filter coefficient (0 < alpha <= 1).
                    Smaller = smoother but more latency.
+            reference_period: Seconds of sample time over which ``alpha`` applies.
+                   With it, timestamped samples are smoothed by elapsed time, so
+                   the response does not depend on how often the filter runs.
+                   Without it (or without a timestamp), every call applies ``alpha``.
         """
+        if reference_period is not None and not reference_period > 0.0:
+            raise ValueError(f"reference_period must be positive, got {reference_period}")
         self.alpha = alpha
+        self.reference_period = reference_period
         self.y = None
         self.is_init = False
+        self._last_timestamp = None
 
-    def next(self, x: np.ndarray) -> np.ndarray:
-        """Apply filter to new value."""
+    def next(self, x: np.ndarray, timestamp: float | None = None) -> np.ndarray:
+        """Apply filter to new value captured at ``timestamp`` (seconds)."""
         if not self.is_init:
             self.y = x.copy()
             self.is_init = True
+            self._last_timestamp = timestamp
             return self.y.copy()
-        self.y = self.y + self.alpha * (x - self.y)
+        alpha = self.alpha
+        if self.reference_period is not None and timestamp is not None and self._last_timestamp is not None:
+            elapsed = timestamp - self._last_timestamp
+            if elapsed <= 0.0:
+                return self.y.copy()
+            alpha = 1.0 - (1.0 - self.alpha) ** (elapsed / self.reference_period)
+        if timestamp is not None:
+            self._last_timestamp = timestamp
+        self.y = self.y + alpha * (x - self.y)
         return self.y.copy()
 
     def reset(self):
         """Reset filter state."""
         self.y = None
         self.is_init = False
+        self._last_timestamp = None

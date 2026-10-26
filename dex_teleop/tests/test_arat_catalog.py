@@ -1,3 +1,6 @@
+import gc
+import weakref
+
 import h5py
 import pytest
 
@@ -25,6 +28,8 @@ from dex_teleop.omnigibson.launcher import (
     _camera_layout_panel_dock,
     _parser,
     _finalize_recording,
+    _freeze_loaded_heap,
+    _may_publish_task_recording,
     _reset_and_wait_for_tracking,
     _resolve_tracking_selection,
     _reset_arat_box,
@@ -458,7 +463,6 @@ def test_launcher_tracking_defaults_preserve_the_quest_hts_preset():
 
     selection = _resolve_tracking_selection(args)
 
-    assert args.source is None
     assert selection.hand_source == "quest"
     assert selection.wrist_source == "quest"
     assert selection.articulation_sources == ("quest",)
@@ -477,7 +481,7 @@ def test_launcher_accepts_manus_quest_control_and_native_rate_comparison():
             "--record-hand-source",
             "quest",
             "--record-hand-source",
-            "hts",
+            "quest",
             "--retargeter",
             "dexpilot",
         ]
@@ -491,26 +495,33 @@ def test_launcher_accepts_manus_quest_control_and_native_rate_comparison():
     assert selection.articulation_sources == ("manus", "quest")
     assert args.retargeter == "dexpilot"
 
-    vibe_args = _parser(AratTaskCatalog()).parse_args(
-        ["--task", "arat_grasp_block_10cm", "--wrist-source", "vibe"]
-    )
-    assert _resolve_tracking_selection(vibe_args).wrist_source == "vive"
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ["--source", "hts"],
+        ["--source", "ovxr"],
+        ["--hand-source", "hts"],
+        ["--wrist-source", "hts"],
+        ["--record-hand-source", "hts"],
+        ["--record-wrist-source", "hts"],
+    ),
+)
+def test_launcher_no_longer_accepts_the_legacy_source_flag_or_hts_alias(argv):
+    with pytest.raises(SystemExit):
+        _parser(AratTaskCatalog()).parse_args(["--task", "arat_grasp_block_10cm", *argv])
 
 
-def test_launcher_rejects_mixing_legacy_and_component_control_flags():
-    args = _parser(AratTaskCatalog()).parse_args(
-        [
-            "--task",
-            "arat_grasp_block_10cm",
-            "--source",
-            "hts",
-            "--hand-source",
-            "manus",
-        ]
-    )
-
-    with pytest.raises(SystemExit, match="cannot be combined"):
-        _resolve_tracking_selection(args)
+@pytest.mark.parametrize("option", ("--wrist-source", "--record-wrist-source"))
+def test_launcher_no_longer_accepts_lighthouse_vive_wrist_sources(option):
+    with pytest.raises(SystemExit):
+        _parser(AratTaskCatalog()).parse_args(
+            ["--task", "arat_grasp_block_10cm", option, "vive"]
+        )
+    with pytest.raises(SystemExit):
+        _parser(AratTaskCatalog()).parse_args(
+            ["--task", "arat_grasp_block_10cm", "--vive-calibration", "vive.json"]
+        )
 
 
 def test_launcher_reset_waits_for_every_configured_tracking_role():
@@ -573,6 +584,9 @@ def test_launcher_records_source_and_retargeter_configuration_metadata():
         retargeting_stream = "adaptive.quest+quest"
         sources = {"quest": source}
 
+        def query(self, function, *args):
+            return function(self, *args)
+
     session = HandTrackingRecordingSession()
     _set_hand_tracking_metadata(session, _Worker(), args)
     metadata = session.writer_kwargs()["stream_metadata"]
@@ -613,12 +627,6 @@ def test_launcher_accepts_tracking_yaw_and_stale_hold_policy():
             "0.5",
             "--stale-frame-policy",
             "hold",
-            "--wrist-joint-rotation-threshold-deg",
-            "140",
-            "--wrist-joint-rotation-window-s",
-            "4",
-            "--wrist-joint-limit-margin-deg",
-            "3",
         ]
     )
 
@@ -627,9 +635,24 @@ def test_launcher_accepts_tracking_yaw_and_stale_hold_policy():
     assert args.position_sensitivity == 1.75
     assert args.maximum_frame_age == 0.5
     assert args.stale_frame_policy == "hold"
-    assert args.wrist_joint_rotation_threshold_deg == 140.0
-    assert args.wrist_joint_rotation_window_s == 4.0
-    assert args.wrist_joint_limit_margin_deg == 3.0
+
+
+@pytest.mark.parametrize(
+    "option",
+    (
+        "--wrist-flip-output",
+        "--wrist-flip-threshold-deg",
+        "--wrist-pair-skew-threshold-ms",
+        "--wrist-joint-rotation-threshold-deg",
+        "--continue-after-wrist-flip",
+    ),
+)
+def test_launcher_no_longer_accepts_wrist_flip_diagnostics(option):
+    argv = ["--task", "arat_grasp_block_10cm", option]
+    if option != "--continue-after-wrist-flip":
+        argv.append("1")
+    with pytest.raises(SystemExit):
+        _parser(AratTaskCatalog()).parse_args(argv)
 
 
 def test_launcher_default_recording_path_is_task_specific():
@@ -736,6 +759,34 @@ def test_preflight_failure_can_close_staging_without_publishing(tmp_path):
     assert recording_env.saved is True
     assert output_path.read_bytes() == b"old valid recording"
     assert staging_path.read_bytes() == b"closed diagnostic recording"
+
+
+def test_failed_task_without_an_engaged_step_does_not_replace_previous_output():
+    failure = RuntimeError("tracker lost before SPACE")
+
+    assert _may_publish_task_recording(failure, []) is False
+    assert _may_publish_task_recording(failure, [[]]) is False
+    assert _may_publish_task_recording(failure, [[], []]) is False
+    assert _may_publish_task_recording(failure, [[], [{"step": 0}]]) is True
+    assert _may_publish_task_recording(None, [[]]) is True
+
+
+def test_loaded_heap_freeze_reclaims_existing_cycles_before_freezing_survivors():
+    class Node:
+        pass
+
+    survivor = Node()
+    first, second = Node(), Node()
+    first.partner, second.partner = second, first
+    cycle = weakref.ref(first)
+    del first, second
+    try:
+        _freeze_loaded_heap()
+        assert cycle() is None
+        assert all(tracked is not survivor for tracked in gc.get_objects())
+    finally:
+        gc.unfreeze()
+    assert any(tracked is survivor for tracked in gc.get_objects())
 
 
 def test_failed_evaluation_append_preserves_previous_output(tmp_path):

@@ -10,6 +10,7 @@ from dex_teleop.retargeting import (
     create_hand_retargeter,
 )
 from dex_teleop.retargeting.dexpilot import DexPilotRetargeter
+from dex_teleop.retargeting.optimizer import LPFilter
 from dex_teleop.tracking.openxr import observation_to_hand_frame
 from dex_teleop.types import (
     FusedHandObservation,
@@ -58,6 +59,61 @@ def test_each_hand_model_retargets_landmarks(hand_model):
 
     assert positions.shape == (profile.degrees_of_freedom,)
     assert np.isfinite(positions).all()
+
+
+def _filtered_step(rate_hz: float, duration_s: float, reference_hz: float = 60.0) -> float:
+    lowpass = LPFilter(0.2, reference_period=1.0 / reference_hz)
+    lowpass.next(np.zeros(1), timestamp=0.0)
+    output = None
+    for index in range(1, round(duration_s * rate_hz) + 1):
+        output = lowpass.next(np.ones(1), timestamp=index / rate_hz)
+    return float(output[0])
+
+
+def test_timestamped_lowpass_response_does_not_depend_on_the_retarget_rate():
+    at_30_hz = _filtered_step(30.0, 0.2)
+    at_120_hz = _filtered_step(120.0, 0.2)
+
+    assert at_30_hz == pytest.approx(at_120_hz, abs=1e-12)
+    assert at_120_hz == pytest.approx(1.0 - 0.8**12, abs=1e-12)
+
+
+def test_timestamped_lowpass_at_its_reference_rate_matches_the_per_call_filter():
+    timed = LPFilter(0.2, reference_period=1.0 / 60.0)
+    per_call = LPFilter(0.2)
+    for index, value in enumerate(np.linspace(0.0, 1.0, 20)):
+        sample = np.array([value, -value])
+        np.testing.assert_allclose(timed.next(sample, timestamp=index / 60.0), per_call.next(sample))
+
+
+def test_timestamped_lowpass_holds_its_output_for_a_repeated_capture_time():
+    lowpass = LPFilter(0.2, reference_period=1.0 / 60.0)
+    lowpass.next(np.zeros(1), timestamp=1.0)
+    first = lowpass.next(np.ones(1), timestamp=1.1)
+
+    np.testing.assert_array_equal(lowpass.next(np.full(1, 5.0), timestamp=1.1), first)
+    lowpass.reset()
+    np.testing.assert_array_equal(lowpass.next(np.full(1, 5.0), timestamp=0.5), [5.0])
+
+
+def test_lowpass_without_timestamps_applies_alpha_per_call():
+    lowpass = LPFilter(0.2, reference_period=1.0 / 60.0)
+    lowpass.next(np.zeros(1))
+
+    np.testing.assert_allclose(lowpass.next(np.ones(1)), [0.2])
+    np.testing.assert_allclose(lowpass.next(np.ones(1)), [0.36])
+
+
+def test_retargeter_smooths_by_capture_time():
+    filtered = LandmarkRetargeter.from_hand_model("sharpa", "right")
+    raw = LandmarkRetargeter.from_hand_model("sharpa", "right")
+    curled = LANDMARKS * np.array([1.0, 0.6, 1.0])
+    opened = filtered.retarget_landmarks(LANDMARKS, timestamp=0.0)
+    np.testing.assert_array_equal(opened, raw.retarget_landmarks(LANDMARKS, apply_filter=False))
+    target = raw.retarget_landmarks(curled, apply_filter=False)
+
+    half_period = filtered.retarget_landmarks(curled, timestamp=0.5 / 60.0)
+    np.testing.assert_allclose(half_period, opened + (1.0 - 0.8**0.5) * (target - opened), atol=1e-9)
 
 
 @pytest.mark.parametrize("side", ("left", "right"))

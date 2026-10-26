@@ -1,5 +1,6 @@
 """Hand bench: fixed Sharpa hand scene, camera rig, and finger-only CLI (no simulator required)."""
 
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -156,12 +157,12 @@ def test_scene_yaml_rejects_hiding_the_hand(tmp_path: Path):
 @pytest.mark.parametrize(
     "argv",
     [
-        ["--wrist-source", "vive"],
+        ["--wrist-source", "manus"],
         ["--wrist-source=quest"],
-        ["--source", "hts"],
-        ["--vive-calibration", "vive.json"],
+        ["--tracking-yaw-deg", "90"],
+        ["--manus-core-calibration", "manus-core-right.json"],
         ["--record-wrist-source", "quest"],
-        ["--manus-expected-tracker-id", "LHR-1"],
+        ["--manus-expected-tracker-id", "ultimate-right"],
     ],
 )
 def test_cli_refuses_wrist_tracking_options(argv):
@@ -173,11 +174,12 @@ def test_cli_refuses_wrist_tracking_options(argv):
 
 def test_cli_accepts_only_finger_sources():
     parser = launcher._parser()
-    for source in ("quest", "hts", "manus"):
+    for source in ("quest", "manus"):
         args = parser.parse_args(["--hand-source", source])
         assert args.hand_source == source
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--hand-source", "vive"])
+    for rejected in ("hts", "ovxr", "vive"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--hand-source", rejected])
     manus = parser.parse_args(["--hand-source", "manus", "--manus-calibration", "right.mcal"])
     launcher._validate_args(manus)
     with pytest.raises(SystemExit, match="require --hand-source manus"):
@@ -255,8 +257,29 @@ def test_recording_metadata_describes_the_fixed_wrist_and_retargeter():
     assert retargeting["configuration"]["sha256"] != "unavailable"
 
 
+def test_tracking_process_records_the_same_metadata_as_the_in_process_worker():
+    from dex_teleop.omnigibson.hand_tracking_recording import HandTrackingRecordingSession
+    from dex_teleop.runtime import ProcessTrackingWorker
+
+    args = launcher._parser().parse_args(["--hand-source", "quest", "--port", "9100"])
+    assert args.tracking_process is True
+    in_process = HandTrackingRecordingSession()
+    launcher.set_recording_metadata(in_process, launcher.create_worker(args, articulation_source=_IdleSource()), args)
+
+    worker = ProcessTrackingWorker(partial(launcher.create_worker, args, articulation_source=_IdleSource()))
+    worker.start()
+    try:
+        assert worker.retargeting_stream == "adaptive.quest+fixed_wrist"
+        child = HandTrackingRecordingSession()
+        launcher.set_recording_metadata(child, worker, args)
+    finally:
+        worker.close()
+
+    assert child.writer_kwargs()["stream_metadata"] == in_process.writer_kwargs()["stream_metadata"]
+
+
 def test_create_worker_pins_the_wrist_to_the_selected_finger_source():
-    args = launcher._parser().parse_args(["--hand-source", "hts"])
+    args = launcher._parser().parse_args(["--hand-source", "quest"])
     source = _IdleSource()
 
     worker = launcher.create_worker(args, articulation_source=source)

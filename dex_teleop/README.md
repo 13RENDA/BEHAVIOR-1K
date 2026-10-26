@@ -19,8 +19,9 @@ environment. Budget roughly 30 minutes of downloads (Isaac Sim wheels plus
 - Two asset archives from Minyeong: `hand_bench_arat_datasets.zip` and
   `hand_bench_sharpa_robot_assets.zip` (see step 3).
 - For the glove: MANUS Metagloves with their wireless dongle, the Linux SDK
-  package `MANUS_Core_3.1.1_SDK.zip` (MANUS resources page or from Minyeong),
-  and a `.mcal` glove calibration for the person wearing the glove.
+  package `MANUS_Core_3.2.1_SDK_Linux.tar.gz` (MANUS Knowledge Center, 3.2.1
+  downloads; it contains the Python SDK), and a `.mcal` glove calibration for
+  the person wearing the glove.
 
 ## 1. Get the code
 
@@ -86,21 +87,25 @@ The first launch compiles shaders and can take several minutes; later launches
 take about 30 s. A successful load prints `Hand bench ready: right_hand_C_MC at
 [0.0, 0.0, 0.891] ... tabletop at 0.750 m`.
 
-## 5. MANUS Integrated SDK (Linux, gloves only)
+## 5. MANUS Core 3.2 Python SDK (Linux, gloves only)
 
-The bench talks to the gloves through a small C++ sidecar that is compiled
-against the official SDK; the proprietary SDK files stay outside the repository.
+The bench talks to the gloves through a small pure-Python sidecar
+(`dex_teleop.tracking.manus_python_bridge`) built on the official MANUS Core
+3.2 Python SDK (`manus_sdk`, pre-built CFFI binaries for Python 3.9-3.14 on
+x86_64 and ARM64). Nothing is compiled and the proprietary SDK files stay
+outside the repository. The legacy C++ sidecar is still available with
+`--manus-backend native` (see `docs/manus-remote-vive-ultimate-runbook.md`).
 
 ```bash
-# 5a. Build tools and libraries the SDK needs
-sudo apt install build-essential libusb-1.0-0-dev libudev-dev zlib1g-dev
+# 5a. Runtime libraries the SDK needs, plus cffi in the conda environment
+sudo apt install libusb-1.0-0 libzmq5 libudev1 zlib1g libgomp1 libcurl4
+pip install "cffi>=1.15"            # or: pip install -e './dex_teleop[manus]'
 
-# 5b. Unpack the SDK where dex_teleop looks for it (the zip already contains a
-#     top-level ManusSDK_v3.1.1/ folder); MANUS_SDK_ROOT=<dir> overrides the search
-mkdir -p ~/manus_setup/vendor
-unzip MANUS_Core_3.1.1_SDK.zip -d ~/manus_setup/vendor/
-ls ~/manus_setup/vendor/ManusSDK_v3.1.1/SDKClient_Linux/ManusSDK/{include,lib}
-#   must show ManusSDK.h ... and libManusSDK_Integrated.so
+# 5b. Unpack the SDK where dex_teleop looks for it; MANUS_SDK_ROOT=<dir> overrides the search
+mkdir -p ~/manus_setup/vendor/ManusSDK_v3.2.1
+tar -xzf MANUS_Core_3.2.1_SDK_Linux.tar.gz -C ~/manus_setup/vendor/ManusSDK_v3.2.1
+ls ~/manus_setup/vendor/ManusSDK_v3.2.1/Python/manus_sdk/linux/amd64/
+#   must show libManusSDK-amd64.so and _manus_sdk.cpython-3XX-x86_64-linux-gnu.so
 
 # 5c. Let your user open the dongle (once), then re-plug the dongle
 sudo tee /etc/udev/rules.d/70-manus-hid.rules >/dev/null <<'EOF'
@@ -113,56 +118,53 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="3325", MODE:="0666"
 EOF
 sudo udevadm control --reload-rules && sudo udevadm trigger
 
-# 5d. Build the Integrated sidecar (-> ~/.cache/dex_teleop/manus_bridge/manus_bridge)
-bash dex_teleop/src/dex_teleop/native/manus_bridge/build_manus_bridge.sh --mode integrated --sdk-root ~/manus_setup
-
-# 5e. Validate with the glove on, dongle plugged in; move your fingers for 10 s
+# 5d. Validate with the glove on, dongle plugged in; move your fingers for 10 s
 dex-teleop-manus-diagnostics --mode integrated --hand right --duration 10 \
+  --sdk-root ~/manus_setup/vendor/ManusSDK_v3.2.1 \
   --glove-calibration /path/to/right-hand.mcal --output /tmp/manus_diagnostics.jsonl
 ```
 
-The diagnostics print a JSON summary and exit 0 when `"passed": true`. If the
-build already exists it is reused; rerun 5d after updating the SDK. Pairing,
-firmware updates, license provisioning, and creating the `.mcal` calibration
-are done in MANUS Core on Windows; the Linux Integrated SDK only consumes
-them. The `.mcal` is optional (`--manus-calibration` may be omitted) but finger
-angles are only accurate with the wearer's own calibration.
+The diagnostics print a JSON summary and exit 0 when `"passed": true`.
+Pairing, firmware updates, license retrieval, and the guided `.mcal`
+calibration can now be done on Linux with the `MANUS Core Dashboard (Linux
+build)` shipped in the same SDK package (it attaches to an Integrated SDK
+session; stop the bench/diagnostic first, only one process may own the
+dongle), or on a Windows MANUS Core as before. The `.mcal` is optional
+(`--manus-calibration` may be omitted) but finger angles are only accurate
+with the wearer's own calibration.
 
 ### Already have the SDK and dongle set up? Start at 5d
 
-Skip 5a-5c if all of this holds; check it first (no bridge needed):
+Skip 5a-5c if all of this holds; check it first:
 
 ```bash
-# SDK must be exactly v3.1.1: the build verifies the SHA-256 of these headers and
-# libraries and rejects any other release. <SDK> is your ManusSDK_v3.1.1 folder.
-ls <SDK>/SDKClient_Linux/ManusSDK/include/ManusSDK.h <SDK>/SDKClient_Linux/ManusSDK/lib/libManusSDK_Integrated.so
+# SDK 3.2.x Python package present for your interpreter (3.9-3.14)
+ls <SDK>/Python/manus_sdk/linux/amd64/   # <SDK> is your ManusSDK_v3.2.1 folder
+python -c "import cffi; print(cffi.__version__)"
 
 # Dongle enumerated (glove may still be off)
 lsusb -d 3325:      # expect: ID 3325:0049 Manus VR (https://www.manus-vr.com) Sensor Dongle
 
 # Your user may open it: the dongle's hidraw node must be crw-rw-rw- (root-only => do 5c)
 for h in /sys/class/hidraw/hidraw*; do v=$(udevadm info -q property -p "$h" | sed -n 's/^ID_VENDOR_ID=//p'); [ "$v" = 3325 ] && ls -l "/dev/$(basename "$h")"; done
-
-g++ --version        # C++17-capable compiler for 5d
 ```
 
-Then run 5d with `--sdk-root <SDK>` (the search also accepts `<SDK>/ManusSDK`,
-`<SDK>/SDKClient_Linux/ManusSDK`, `<SDK>/SDKMinimalClient_Linux/ManusSDK`, or a
-parent with `vendor/ManusSDK_v*/`), and 5e with your existing `.mcal`. Whether
-the glove is paired, powered, and licensed can only be checked by talking to
-the SDK, so 5e is that check; 5d is a two-second compile. Reading 5e:
+Then run 5d with `--sdk-root <SDK>` (the search also accepts a parent with
+`vendor/ManusSDK_v*/`, newest release first, or an installed `manus_sdk`
+package) and your existing `.mcal`. Reading 5d:
 
 - `"passed": true`: glove, dongle, license, and calibration are fine; go to 6.
-- `Could not find a matching MANUS SDK header and libManusSDK_Integrated.so`:
-  wrong `--sdk-root` or an SDK release other than 3.1.1.
-- `MANUS bridge did not publish a validated right-hand articulation within N
-  seconds`: SDK and sidecar work, but no glove data: glove off or not paired to
-  this dongle, dongle not readable (permissions), or no SDK license on it.
+- `Could not find the MANUS Core 3.2 Python SDK`: wrong `--sdk-root` or a
+  3.1.x package (no `Python/` folder).
+- `no_glove: MANUS connection did not qualify license, right-hand topology,
+  raw frame`: SDK and sidecar work, but no glove data: glove off or not paired
+  to this dongle, dongle not readable (permissions), or no `SDK (integrated)`
+  license on it (`integrated_license_unavailable` once a glove is seen).
 - `Calibration rejected for right glove`: the `.mcal` belongs to another glove
   or SDK version; omit `--glove-calibration` to test without it.
 
-The official `SDKMinimalClient_Linux` example from the SDK zip (mode `1`,
-Integrated) is an equivalent independent glove check if you already build it.
+The official `Python/examples/minimal_client.py` from the SDK package (mode
+`1`, Integrated) is an equivalent independent glove check.
 
 ## 6. Run the hand bench with the glove
 
@@ -177,8 +179,10 @@ hand, Ctrl+C exits. Useful options: `--stale-frame-policy hold` (hold the last
 pose instead of failing on a stale stream), `--finger-target-scale 0.8`
 (shrink flexion), `--retargeter dexpilot` (optional alternative backend,
 `pip install -e './dex_teleop[dexpilot]'`), `--show-arm` (reveal the hidden
-Franka that carries the hand). Wrist options (`--wrist-source`, `--source`,
-VIVE/tracker flags) are rejected on purpose. Quest hand tracking works too:
+Franka that carries the hand), `--no-tracking-process` (retarget inside the
+simulator process instead of a child process; slower, see
+`docs/README_full.md`). Wrist options (`--wrist-source`, `--tracking-yaw-deg`,
+MANUS tracker flags) are rejected on purpose. Quest hand tracking works too:
 `--hand-source quest` listens for the HTS app on UDP 9000.
 
 ## 7. Record a session, with or without the EMG wristband
@@ -250,12 +254,13 @@ pytest -q dex_teleop/tests
   the launchers always use the checkout's `datasets/`.
 - `Missing required hand bench assets`: step 3 is incomplete; the message
   lists the missing files.
-- `Could not find a matching MANUS SDK header and libManusSDK_Integrated.so`:
-  check the path in 5b or set `MANUS_SDK_ROOT=~/manus_setup/vendor/ManusSDK_v3.1.1`.
-- `MANUS bridge did not publish a validated right-hand articulation within
-  N seconds` (diagnostics or the bench): the SDK and sidecar are fine but no
-  glove data arrived. Power the glove, re-plug the dongle, check the udev rule
-  (5c), and confirm in MANUS Core (Windows) that the dongle carries the SDK
+- `Could not find the MANUS Core 3.2 Python SDK`: check the path in 5b or set
+  `MANUS_SDK_ROOT=~/manus_setup/vendor/ManusSDK_v3.2.1`.
+- `no_glove ...` / `MANUS bridge did not publish a validated right-hand
+  articulation within N seconds` (diagnostics or the bench): the SDK and
+  sidecar are fine but no glove data arrived. Power the glove, re-plug the
+  dongle, check the udev rule (5c), and confirm in the MANUS Core Dashboard
+  (Linux build, or Windows) that the dongle carries the SDK (integrated)
   license.
 - `BleakError: adapter 'hci0' not found`: pass the adapter listed by
   `bluetoothctl list` / `ls /sys/class/bluetooth` with `--emg-adapter`.
@@ -268,7 +273,17 @@ pytest -q dex_teleop/tests
 
 ## More
 
-The ARAT task launcher (`dex_teleop/scripts/launch_og.py`), recording format,
-replay, Quest/VIVE wrist tracking, MANUS Remote mode, and EMG recording are
-documented in the previous README, kept in `dex_teleop/docs/` (untracked; ask
-Minyeong) and in the `arat` branch history (`git show a8ddd6bfd:dex_teleop/README.md`).
+The ARAT task launcher (`dex_teleop/scripts/launch_og.py`) reads its options
+from a YAML preset in `dex_teleop/configs/` (`manus_core.yaml`, the default:
+MANUS gloves + VIVE Tracker Ultimate, entirely on this Linux host through the
+MANUS Core 3.2 Python SDK and VIVE Hub for Linux, with optional Metaglove Pro
+Haptic feedback; `hts.yaml`: Quest hand and wrist tracking). Select one with
+`--config <name>`, override any key with its command-line flag, or pass
+`--no-config` for the built-in defaults. Setup, calibration, acceptance
+checks and haptics for the default path are in
+`dex_teleop/docs/manus-linux-vive-ultimate-runbook.md`; the previous Windows
+MANUS Core path in `dex_teleop/docs/manus-remote-vive-ultimate-runbook.md`.
+The launcher, recording format, replay, Quest wrist tracking, and EMG
+recording are documented in `dex_teleop/guide.md` and the previous README,
+kept in `dex_teleop/docs/` and in the `arat` branch history
+(`git show a8ddd6bfd:dex_teleop/README.md`).

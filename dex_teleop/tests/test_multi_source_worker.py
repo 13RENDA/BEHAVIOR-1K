@@ -839,3 +839,89 @@ def test_native_drains_preserve_samples_acquired_while_retargeting_is_slow():
     finally:
         retargeter.release.set()
         worker.close()
+
+
+class _FrameLoggingRetargeter(_FakeRetargeter):
+    def __init__(self):
+        super().__init__()
+        self.frame_ids = []
+
+    def retarget(self, frame):
+        self.frame_ids.append(frame.source_frame_id)
+        return super().retarget(frame)
+
+
+def test_once_per_snapshot_retargets_only_the_newest_sample_after_each_read():
+    base = time.monotonic()
+    quest = _LatestDrainingSource("quest")
+    retargeter = _FrameLoggingRetargeter()
+    session = HandTrackingRecordingSession()
+    worker = MultiSourceTrackingWorker(
+        {"quest": quest},
+        articulation_source="quest",
+        wrist_source="quest",
+        retargeter=retargeter,
+        handedness=Handedness.RIGHT,
+        recording_session=session,
+        retarget_once_per_snapshot=True,
+        unread_command_lifetime=10.0,
+    )
+
+    def push(frame_id):
+        timestamp = base + frame_id * 0.01
+        quest.push_wrist(_wrist(timestamp, source="hts", frame_id=frame_id, x=frame_id))
+        quest.push_articulation(_articulation(timestamp, source="hts", frame_id=frame_id))
+
+    def recorded_articulations():
+        return len(session.writer_kwargs()["articulation_streams"].get("articulation.quest", ()))
+
+    worker.start()
+    try:
+        push(1)
+        _wait_until(lambda: retargeter.frame_ids == [1])
+        for frame_id in range(2, 6):
+            push(frame_id)
+        _wait_until(lambda: recorded_articulations() == 5)
+        time.sleep(20 * worker.poll_interval)
+        assert retargeter.frame_ids == [1]
+
+        assert worker.snapshot().frame.source_frame_id == 1
+        _wait_until(lambda: retargeter.frame_ids == [1, 5])
+        assert worker.snapshot().frame.source_frame_id == 5
+
+        recorded = session.writer_kwargs()
+        assert [
+            sample.source_frame_id
+            for sample in recorded["articulation_streams"]["articulation.quest"]
+        ] == [1, 2, 3, 4, 5]
+        retargeted = recorded["retargeting_streams"][worker.retargeting_stream]
+        assert [sample.articulation_row for sample in retargeted] == [0, 4]
+    finally:
+        worker.close()
+
+
+def test_once_per_snapshot_never_holds_an_unread_command_past_its_lifetime():
+    base = time.monotonic()
+    quest = _LatestDrainingSource("quest")
+    retargeter = _FrameLoggingRetargeter()
+    worker = MultiSourceTrackingWorker(
+        {"quest": quest},
+        articulation_source="quest",
+        wrist_source="quest",
+        retargeter=retargeter,
+        handedness=Handedness.RIGHT,
+        retarget_once_per_snapshot=True,
+        unread_command_lifetime=0.05,
+    )
+    worker.start()
+    try:
+        for frame_id in (1, 2, 3):
+            timestamp = base + frame_id * 0.01
+            quest.push_wrist(_wrist(timestamp, source="hts", frame_id=frame_id, x=frame_id))
+            quest.push_articulation(_articulation(timestamp, source="hts", frame_id=frame_id))
+            if frame_id == 1:
+                _wait_until(lambda: retargeter.frame_ids == [1])
+        _wait_until(lambda: retargeter.frame_ids == [1, 3])
+        assert worker.snapshot().frame.source_frame_id == 3
+    finally:
+        worker.close()

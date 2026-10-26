@@ -14,6 +14,14 @@ from dex_teleop.types import Handedness
 MANUS_CORE_CALIBRATION_SCHEMA_VERSION = 1
 MANUS_CORE_WORLD_FRAME = "manus_core_world_y_up_rh_z_to_viewer_m"
 MANUS_BAKED_WRIST_SEMANTICS = "core_baked_skeleton_wrist"
+# The launcher's right-handed tracking convention (x forward, y left, z up),
+# i.e. the frame the Quest/HTS wrist is converted into.
+MANUS_DEFAULT_REFERENCE_FRAME = "dex_teleop_tracking_rh_x_forward_z_up_m"
+# Core world is x-right, y-up, z-toward-viewer (SteamVR's standing universe);
+# forward = -z. Mapping to the tracking frame: x = -z_core, y = -x_core,
+# z = y_core. Rotation-only: the adapter anchors position at engagement, so a
+# translation would be absorbed anyway.
+MANUS_CORE_WORLD_TO_TRACKING_QUATERNION_XYZW = (0.5, -0.5, -0.5, 0.5)
 
 
 @dataclass(frozen=True)
@@ -211,11 +219,44 @@ class ManusCoreCalibration:
             "wrists": [wrist.as_mapping() for wrist in self.wrists],
         }
 
+    @classmethod
+    def default(cls) -> "ManusCoreCalibration":
+        """Built-in calibration used when no measured Core-world file is given.
+
+        It only changes the axis convention (Core Y-up world to the launcher's
+        Z-up tracking frame) and applies no wrist residual, mirroring how the
+        Quest wrist is handled: absolute position and yaw are taken care of by
+        anchoring at engagement and ``--tracking-yaw-deg``, so align SteamVR
+        room-setup "forward" with the robot's +X. Use a measured file when the
+        recorded MANUS wrist must be expressed in a surveyed robot frame.
+        """
+
+        return cls(
+            reference_frame=MANUS_DEFAULT_REFERENCE_FRAME,
+            reference_from_core_world=RigidTransform(
+                (0.0, 0.0, 0.0), MANUS_CORE_WORLD_TO_TRACKING_QUATERNION_XYZW
+            ),
+            wrists=tuple(
+                ManusWristCalibration(
+                    handedness=side,
+                    skeleton_wrist_to_anatomical_wrist=RigidTransform.identity(),
+                    tracker_offset_preset=None,
+                )
+                for side in (Handedness.LEFT, Handedness.RIGHT)
+            ),
+        )
+
+    @property
+    def is_default(self) -> bool:
+        return self.as_mapping() == self.default().as_mapping()
+
 
 __all__ = [
     "MANUS_BAKED_WRIST_SEMANTICS",
     "MANUS_CORE_CALIBRATION_SCHEMA_VERSION",
     "MANUS_CORE_WORLD_FRAME",
+    "MANUS_CORE_WORLD_TO_TRACKING_QUATERNION_XYZW",
+    "MANUS_DEFAULT_REFERENCE_FRAME",
     "ManusCoreCalibration",
     "ManusWristCalibration",
 ]

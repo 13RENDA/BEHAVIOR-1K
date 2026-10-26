@@ -5,6 +5,7 @@ import pytest
 
 from dex_teleop.omnigibson.launcher import (
     _effective_manus_hand_motion,
+    _manus_core_calibration,
     _parser,
     _resolve_tracking_selection,
     _set_hand_tracking_metadata,
@@ -12,6 +13,10 @@ from dex_teleop.omnigibson.launcher import (
 )
 from dex_teleop.omnigibson.hand_tracking_recording import (
     HandTrackingRecordingSession,
+)
+from dex_teleop.tracking.manus_calibration import (
+    MANUS_DEFAULT_REFERENCE_FRAME,
+    ManusCoreCalibration,
 )
 
 
@@ -58,7 +63,60 @@ def test_existing_manus_hand_invocation_remains_integrated_gloves_only():
     assert selection.hand_source == "manus"
     assert selection.wrist_source == "quest"
     assert args.manus_mode == "integrated"
-    assert _effective_manus_hand_motion(args) == "auto"
+    assert _effective_manus_hand_motion(selection) == "auto"
+
+
+def test_hand_motion_is_derived_from_the_wrist_role():
+    articulation_only = _resolve_tracking_selection(
+        _arguments("--hand-source", "manus", "--manus-mode", "remote")
+    )
+    record_only_wrist = _resolve_tracking_selection(
+        _arguments("--record-wrist-source", "manus", "--manus-mode", "remote")
+    )
+
+    assert _effective_manus_hand_motion(articulation_only) == "auto"
+    assert _effective_manus_hand_motion(record_only_wrist) == "tracker"
+    with pytest.raises(SystemExit):
+        _arguments("--hand-source", "manus", "--manus-hand-motion", "tracker")
+
+
+def test_remote_manus_wrist_falls_back_to_the_default_core_calibration():
+    args = _arguments(
+        "--wrist-source",
+        "manus",
+        "--manus-mode",
+        "remote",
+        "--manus-expected-tracker-id",
+        "ultimate-right",
+        "--manus-expected-tracker-user-id",
+        "1",
+    )
+    selection = _resolve_tracking_selection(args)
+
+    _validate_manus_selection(args, selection)
+
+    calibration = _manus_core_calibration(args, selection)
+    assert isinstance(calibration, ManusCoreCalibration) and calibration.is_default
+    assert calibration.reference_frame == MANUS_DEFAULT_REFERENCE_FRAME
+    # Articulation-only MANUS keeps the raw Core world: its root is never used.
+    assert (
+        _manus_core_calibration(
+            args, _resolve_tracking_selection(_arguments("--hand-source", "manus"))
+        )
+        is None
+    )
+    # An explicit file still wins.
+    assert _manus_core_calibration(
+        _arguments(
+            "--wrist-source",
+            "manus",
+            "--manus-mode",
+            "remote",
+            "--manus-core-calibration",
+            "measured.json",
+        ),
+        selection,
+    ) == "measured.json"
 
 
 def test_launcher_preserves_negotiated_manus_protocol_metadata():
@@ -81,6 +139,7 @@ def test_launcher_preserves_negotiated_manus_protocol_metadata():
         wrist_source="manus",
         control_wrist_stream="wrist.control",
     )
+    worker.query = lambda function, *args: function(worker, *args)
     session = HandTrackingRecordingSession()
     args = _arguments("--hand-source", "manus")
 
@@ -115,7 +174,7 @@ def test_remote_manus_can_serve_both_selected_modalities(tmp_path):
 
     assert selection.articulation_sources == ("manus",)
     assert selection.wrist_sources == ("manus",)
-    assert _effective_manus_hand_motion(args) == "tracker"
+    assert _effective_manus_hand_motion(selection) == "tracker"
 
 
 def test_remote_manus_can_be_a_record_only_wrist_source(tmp_path):
@@ -219,7 +278,7 @@ def test_remote_manus_wrist_rejects_calibration_tracker_id_mismatch(tmp_path):
     (
         (
             ("--wrist-source", "manus"),
-            "requires --manus-mode remote",
+            "needs a tracker: --manus-tracker-feed vive_ultimate",
         ),
         (
             (
@@ -228,7 +287,7 @@ def test_remote_manus_wrist_rejects_calibration_tracker_id_mismatch(tmp_path):
                 "--manus-core-calibration",
                 "calibration.json",
             ),
-            "--manus-core-calibration.*require --manus-mode remote",
+            "--manus-core-calibration.*requires a selected or record-only MANUS wrist source",
         ),
         (
             (
@@ -237,20 +296,7 @@ def test_remote_manus_wrist_rejects_calibration_tracker_id_mismatch(tmp_path):
                 "--manus-mode",
                 "remote",
             ),
-            "requires --manus-core-calibration",
-        ),
-        (
-            (
-                "--wrist-source",
-                "manus",
-                "--manus-mode",
-                "remote",
-                "--manus-core-calibration",
-                "calibration.json",
-                "--manus-hand-motion",
-                "imu",
-            ),
-            "requires --manus-hand-motion tracker",
+            "requires --manus-expected-tracker-id",
         ),
         (
             (
@@ -273,6 +319,48 @@ def test_remote_manus_wrist_rejects_calibration_tracker_id_mismatch(tmp_path):
             ),
             "requires tracker monitoring",
         ),
+        (
+            ("--manus-tracker-feed", "vive_ultimate"),
+            "require a selected or record-only MANUS source",
+        ),
+        (
+            ("--hand-source", "manus", "--manus-tracker-feed", "vive_ultimate"),
+            "--manus-tracker-feed supplies the MANUS wrist",
+        ),
+        (
+            (
+                "--wrist-source",
+                "manus",
+                "--manus-mode",
+                "remote",
+                "--manus-tracker-feed",
+                "vive_ultimate",
+            ),
+            "requires --manus-mode integrated",
+        ),
+        (
+            (
+                "--wrist-source",
+                "manus",
+                "--manus-backend",
+                "native",
+                "--manus-tracker-feed",
+                "vive_ultimate",
+            ),
+            "use --manus-backend python",
+        ),
+        (
+            ("--hand-source", "manus", "--manus-backend", "native", "--manus-haptics"),
+            "use --manus-backend python",
+        ),
+        (
+            ("--hand-source", "manus", "--manus-bridge", "/opt/manus_bridge"),
+            "requires --manus-backend native",
+        ),
+        (
+            ("--wrist-source", "manus", "--manus-tracker-feed", "vive_ultimate"),
+            "requires --manus-expected-tracker-id.*serial",
+        ),
     ),
 )
 def test_manus_launcher_rejects_unsafe_or_unused_combinations(arguments, message):
@@ -281,3 +369,80 @@ def test_manus_launcher_rejects_unsafe_or_unused_combinations(arguments, message
 
     with pytest.raises(SystemExit, match=message):
         _validate_manus_selection(args, selection)
+
+
+def test_integrated_vive_ultimate_feed_serves_the_wrist_without_a_user_id():
+    args = _arguments(
+        "--hand-source",
+        "manus",
+        "--wrist-source",
+        "manus",
+        "--manus-tracker-feed",
+        "vive_ultimate",
+        "--manus-expected-tracker-id",
+        "59-A33R03250",
+        "--manus-tracker-to-wrist-translation=-0.003,-0.058,-0.043",
+    )
+    selection = _resolve_tracking_selection(args)
+
+    _validate_manus_selection(args, selection)
+
+    assert args.manus_backend == "python" and args.manus_mode == "integrated"
+    assert args.manus_tracker_to_wrist_translation == (-0.003, -0.058, -0.043)
+    assert _effective_manus_hand_motion(selection) == "tracker"
+    calibration = _manus_core_calibration(args, selection)
+    assert isinstance(calibration, ManusCoreCalibration) and calibration.is_default
+    # An explicit user id is still accepted and validated.
+    pinned = _arguments(
+        "--wrist-source", "manus", "--manus-tracker-feed", "vive_ultimate",
+        "--manus-expected-tracker-id", "59-A33R03250", "--manus-expected-tracker-user-id", "-1",
+    )
+    with pytest.raises(SystemExit, match="non-negative"):
+        _validate_manus_selection(pinned, _resolve_tracking_selection(pinned))
+    with pytest.raises(SystemExit):  # argparse: "expected 3 finite comma-separated numbers"
+        _arguments("--manus-tracker-to-wrist-translation", "1,2")
+
+
+def test_launcher_builds_the_python_manus_source_with_the_feed(monkeypatch):
+    from dex_teleop.omnigibson import launcher
+
+    captured = {}
+
+    class _Recorder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(launcher, "ManusIntegratedSource", _Recorder)
+    args = _arguments(
+        "--hand-source", "manus", "--wrist-source", "manus",
+        "--manus-tracker-feed", "vive_ultimate",
+        "--manus-expected-tracker-id", "59-A33R03250",
+        "--vive-ultimate-socket", "/run/vut.sock",
+        "--manus-haptics",
+    )
+    selection = _resolve_tracking_selection(args)
+    _validate_manus_selection(args, selection)
+
+    sources = launcher._create_tracking_sources(args, selection)
+
+    assert set(sources) == {"manus"}
+    assert captured["backend"] == "python"
+    assert captured["mode"] == "integrated"
+    assert captured["tracker_feed"] == "vive_ultimate"
+    assert captured["vive_ultimate_socket"] == "/run/vut.sock"
+    assert captured["wrist_composition"] == "bridge"
+    assert captured["hand_motion"] == "tracker"
+    assert captured["require_tracker_for_wrist"] is True
+    assert captured["expected_tracker_user_id"] is None
+    assert captured["haptics"] is True
+    assert captured["tracker_to_wrist"] is None and captured["tracker_to_casing"] is None
+
+
+def test_manus_sdk_metadata_names_the_python_bridge():
+    from dex_teleop.omnigibson.launcher import _manus_sdk_metadata
+
+    metadata = _manus_sdk_metadata(_arguments("--hand-source", "manus"))
+
+    assert metadata["backend"] == "python"
+    assert metadata["bridge"]["file"] == "manus_python_bridge.py"
+    assert len(metadata["bridge"]["sha256"]) == 64

@@ -126,8 +126,29 @@ def _frozen_provenance(value: Mapping[str, Any] | None, sample_name: str) -> Map
     return MappingProxyType(document)
 
 
+class _ReadOnlyMappingsPickle:
+    """Pickle a validated frozen sample whose mapping fields are read-only views.
+
+    Every dict-valued field of these samples is a ``MappingProxyType`` after
+    validation, so state round-trips as plain dicts and is restored as-is;
+    read-only arrays keep their flag through pickle.
+    """
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            name: dict(value) if isinstance(value, MappingProxyType) else value
+            for name, value in self.__dict__.items()
+        }
+
+    def __setstate__(self, state: Mapping[str, Any]) -> None:
+        for name, value in state.items():
+            object.__setattr__(
+                self, name, MappingProxyType(value) if isinstance(value, dict) else value
+            )
+
+
 @dataclass(frozen=True)
-class HandArticulationSample:
+class HandArticulationSample(_ReadOnlyMappingsPickle):
     """One named, wrist-local hand-articulation sample.
 
     The schema may be OpenXR-26, MediaPipe-21, a vendor-native skeleton, or a
@@ -252,7 +273,7 @@ class HandArticulationSample:
 
 
 @dataclass(frozen=True)
-class WristPoseSample:
+class WristPoseSample(_ReadOnlyMappingsPickle):
     """One tracked anatomical-wrist pose in a named reference frame."""
 
     timestamp: float
@@ -342,7 +363,7 @@ class FusedHandObservation:
 
 
 @dataclass(frozen=True)
-class HandFrame:
+class HandFrame(_ReadOnlyMappingsPickle):
     """One source-independent hand sample in a right-handed world frame.
 
     ``timestamp`` is the sample time in the desktop monotonic clock domain.

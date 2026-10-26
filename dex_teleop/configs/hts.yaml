@@ -1,0 +1,42 @@
+# launch_og.py preset: Quest Hand Tracking Streamer (HTS) for both the finger
+# articulation and the wrist. No MANUS or VIVE hardware is involved.
+#
+# The desktop receiver binds a local UDP/TCP endpoint and the Quest HTS app
+# sends matched wrist + 21-landmark frames to it.
+#
+#   python dex_teleop/scripts/launch_og.py --config hts --task arat_grasp_block_10cm
+#
+# Keys are launch_og.py option names with the leading dashes removed. null keeps
+# the built-in default; command-line flags override this file.
+
+# --- Tracking sources ------------------------------------------------------
+hand_source: quest
+wrist_source: quest
+hand: right
+
+# --- HTS receiver ----------------------------------------------------------
+host: 0.0.0.0             # local bind address, not the headset address
+port: 9000
+protocol: udp             # or tcp
+
+# --- Retargeting and control -----------------------------------------------
+retargeter: adaptive
+maximum_source_skew: 0.05 # unused for Quest/Quest: both components arrive as one matched frame
+maximum_frame_age: 0.25
+stale_frame_policy: error
+initial_frame_timeout: 10.0
+position_sensitivity: 1.5
+tracking_yaw_deg: 0.0
+
+# --- Recording -------------------------------------------------------------
+# SPACE engages teleoperation and starts recording; R ends the episode and
+# starts the next after a reset; Ctrl+C finalizes the file.
+record_hand_poses: true
+# recording_path: dex_teleop/outputs/recordings/session_01.hdf5   # single --task only
+# record_hand_source: [manus]       # comparison-only MANUS articulation (Integrated, gloves only)
+# manus_calibration: ~/manus_setup/calibration/right.mcal
+
+# --- OYMotion EMG (optional) -----------------------------------------------
+# emg: true
+# emg_device: D8:71:4D:8D:99:92
+# emg_adapter: hci1

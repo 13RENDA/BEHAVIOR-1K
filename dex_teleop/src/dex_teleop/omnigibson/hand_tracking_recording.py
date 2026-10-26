@@ -90,6 +90,16 @@ def _sample_key(sample: HandArticulationSample | WristPoseSample) -> tuple:
     return ("capture", round(sample.timestamp * 1e9))
 
 
+def _retargeted_key(sample: RetargetedCommandSample) -> tuple:
+    return (
+        round(sample.command.timestamp * 1e9),
+        sample.articulation_stream,
+        sample.articulation_row,
+        sample.wrist_stream,
+        sample.wrist_row,
+    )
+
+
 def _articulations_equal(
     first: HandArticulationSample, second: HandArticulationSample
 ) -> bool:
@@ -245,13 +255,7 @@ class HandTrackingRecordingSession:
         """Append one selected or shadow retargeter output and return its row."""
 
         _validate_identifier(stream_id, "retargeting stream")
-        key = (
-            round(sample.command.timestamp * 1e9),
-            sample.articulation_stream,
-            sample.articulation_row,
-            sample.wrist_stream,
-            sample.wrist_row,
-        )
+        key = _retargeted_key(sample)
         with self._lock:
             self._require_open()
             _validate_reference(

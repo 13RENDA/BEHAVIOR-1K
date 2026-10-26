@@ -1,10 +1,19 @@
 """MANUS SDK articulation and same-callback global-wrist source.
 
-The proprietary SDK runs in a small native sidecar.  This module consumes its
+The proprietary SDK runs in a small sidecar process: by default the pure-Python
+``dex_teleop.tracking.manus_python_bridge`` on the MANUS Core 3.2 Python SDK,
+or the legacy C++ ``native/manus_bridge`` sidecar. This module consumes their
 versioned JSON-lines protocol and publishes the validated 25-node MANUS hand as
-wrist-local named articulation plus the preserved global wrist. Integrated
-remains the default gloves-only deployment; Remote connects from Linux to
-MANUS Core on Windows and is the production glove + tracker path.
+wrist-local named articulation plus the preserved global wrist.
+
+Deployments:
+
+- Integrated on Linux with a VIVE Ultimate Tracker streamed by VIVE Hub for
+  Linux (``tracker_feed="vive_ultimate"``) is the production glove + tracker
+  path; no Windows machine is involved.
+- Integrated without a tracker feed is the gloves-only fallback.
+- Remote connects to MANUS Core 3.2 on Windows, which then supplies the
+  tracker-driven wrist (the historical production path).
 """
 
 from __future__ import annotations
@@ -13,6 +22,9 @@ import json
 import hashlib
 import logging
 import os
+import platform
+import re
+import sys
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -33,6 +45,12 @@ from dex_teleop.tracking.manus_calibration import (
 )
 from dex_teleop.tracking.multimodal import HandTrackingSampleBatch
 from dex_teleop.tracking.transforms import RigidTransform, inverse_transform
+from dex_teleop.tracking.vive_ultimate import (
+    VUT_DEFAULT_FRAME,
+    VUT_DEFAULT_SOCKET,
+    VUT_FRAMES,
+    VUT_TRACKING_SYSTEM,
+)
 from dex_teleop.types import (
     HandArticulationSample,
     Handedness,
@@ -45,13 +63,25 @@ from dex_teleop.types import (
 LOGGER = logging.getLogger(__name__)
 
 MANUS_PROTOCOL = "dex_teleop.manus"
-MANUS_PROTOCOL_VERSION = 2
+MANUS_PROTOCOL_VERSION = 3
+MANUS_NATIVE_PROTOCOL_VERSION = 2
 MANUS_LEGACY_PROTOCOL_VERSION = 1
+MANUS_SUPPORTED_PROTOCOL_VERSIONS = (
+    MANUS_LEGACY_PROTOCOL_VERSION,
+    MANUS_NATIVE_PROTOCOL_VERSION,
+    MANUS_PROTOCOL_VERSION,
+)
 MANUS_ARTICULATION_SCHEMA = "openxr25_no_palm"
 MANUS_JOINT_NAMES = tuple(name for name in OPENXR_HAND_JOINT_NAMES if name != "palm")
 MANUS_MODES = ("integrated", "remote")
+MANUS_BACKENDS = ("python", "native")
+MANUS_TRACKER_FEEDS = ("none", "vive_ultimate")
+MANUS_WRIST_COMPOSITIONS = ("bridge", "core")
 MANUS_HAND_MOTIONS = ("auto", "tracker", "tracker_rotation_only", "imu", "none")
+# Tracking system Core reports for an Ultimate received through SteamVR on
+# Windows; the Linux VIVE Hub feed reports VUT_TRACKING_SYSTEM instead.
 MANUS_ULTIMATE_TRACKER_SYSTEM = "openvr"
+MANUS_PYTHON_BRIDGE_MODULE = "dex_teleop.tracking.manus_python_bridge"
 
 
 class ManusProtocolError(ValueError):
@@ -139,6 +169,31 @@ def _validate_hand_motion(value: str) -> str:
     return motion
 
 
+def _validate_backend(value: str) -> str:
+    backend = str(value).casefold()
+    if backend not in MANUS_BACKENDS:
+        raise ValueError(f"MANUS backend must be one of {MANUS_BACKENDS}, got {value!r}")
+    return backend
+
+
+def _validate_tracker_feed(value: str) -> str:
+    feed = str(value).casefold()
+    if feed not in MANUS_TRACKER_FEEDS:
+        raise ValueError(
+            f"MANUS tracker feed must be one of {MANUS_TRACKER_FEEDS}, got {value!r}"
+        )
+    return feed
+
+
+def _validate_wrist_composition(value: str) -> str:
+    composition = str(value).casefold()
+    if composition not in MANUS_WRIST_COMPOSITIONS:
+        raise ValueError(
+            f"MANUS wrist composition must be one of {MANUS_WRIST_COMPOSITIONS}, got {value!r}"
+        )
+    return composition
+
+
 def _protocol_capabilities(version: int) -> tuple[str, ...]:
     if version == MANUS_LEGACY_PROTOCOL_VERSION:
         return (
@@ -146,9 +201,20 @@ def _protocol_capabilities(version: int) -> tuple[str, ...]:
             "python_required_hand_filter",
             "same_callback_pairing",
         )
-    if version == MANUS_PROTOCOL_VERSION:
+    if version == MANUS_NATIVE_PROTOCOL_VERSION:
         return (
             "connection_generation",
+            "native_required_hand",
+            "reconnect_requalification",
+            "same_callback_pairing",
+            "tracker_health_metadata",
+        )
+    if version == MANUS_PROTOCOL_VERSION:
+        return (
+            "bridge_wrist_composition",
+            "connection_generation",
+            "haptic_commands",
+            "injected_tracker_feed",
             "native_required_hand",
             "reconnect_requalification",
             "same_callback_pairing",
@@ -179,15 +245,50 @@ def _sdk_directories(root: Path) -> tuple[Path, ...]:
         root / "ManusSDK",
         root / "SDKClient_Linux/ManusSDK",
         root / "SDKMinimalClient_Linux/ManusSDK",
+        root / "C++/SDKClient/ManusSDK",
+        root / "C++/SDKMinimalClient/ManusSDK",
     ]
     vendor = root / "vendor"
     if vendor.is_dir():
-        candidates.extend(sorted(vendor.glob("ManusSDK_v*/SDKClient_Linux/ManusSDK")))
+        vendor_candidates = [
+            path
+            for pattern in (
+                "ManusSDK_v*/SDKClient_Linux/ManusSDK",
+                "ManusSDK_v*/SDKMinimalClient_Linux/ManusSDK",
+                "ManusSDK_v*/ROS2/ManusSDK",
+                "ManusSDK_v*/C++/SDKClient/ManusSDK",
+                "ManusSDK_v*/C++/SDKMinimalClient/ManusSDK",
+            )
+            for path in sorted(vendor.glob(pattern))
+        ]
+        # Several installed releases resolve to the newest unless a root is explicit.
         candidates.extend(
-            sorted(vendor.glob("ManusSDK_v*/SDKMinimalClient_Linux/ManusSDK"))
+            sorted(
+                vendor_candidates,
+                key=lambda path: _release_version(path.relative_to(vendor).parts[0]),
+                reverse=True,
+            )
         )
-        candidates.extend(sorted(vendor.glob("ManusSDK_v*/ROS2/ManusSDK")))
     return tuple(dict.fromkeys(path.resolve() for path in candidates))
+
+
+def _release_version(release_directory: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", release_directory))
+
+
+def _unified_sdk_library(candidate: Path) -> Path | None:
+    """The SDK v3.2 library that serves both Integrated and Remote, if present."""
+
+    architecture = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
+    }.get(platform.machine().lower())
+    if architecture is None:
+        return None
+    library = candidate / f"lib/{architecture}/libManusSDK-{architecture}.so"
+    return library if library.is_file() else None
 
 
 def discover_manus_sdk(
@@ -206,8 +307,12 @@ def discover_manus_sdk(
         for candidate in _sdk_directories(root):
             searched.append(candidate)
             header = candidate / "include/ManusSDK.h"
-            integrated_library = candidate / "lib/libManusSDK_Integrated.so"
-            remote_library = candidate / "lib/libManusSDK.so"
+            unified_library = _unified_sdk_library(candidate)
+            if unified_library is not None:
+                integrated_library = remote_library = unified_library
+            else:
+                integrated_library = candidate / "lib/libManusSDK_Integrated.so"
+                remote_library = candidate / "lib/libManusSDK.so"
             selected_library = (
                 integrated_library if mode == "integrated" else remote_library
             )
@@ -221,11 +326,63 @@ def discover_manus_sdk(
     locations = "\n".join(f"  - {path}" for path in searched)
     expected = (
         "libManusSDK_Integrated.so" if mode == "integrated" else "Remote libManusSDK.so"
-    )
+    ) + " (SDK 3.1) or lib/<arch>/libManusSDK-<arch>.so (SDK 3.2)"
     raise SourceUnavailableError(
         f"Could not find a matching MANUS SDK header and {expected}. "
         "Set MANUS_SDK_ROOT or pass sdk_root. Searched:\n" + locations
     )
+
+
+def _python_sdk_directories(root: Path) -> tuple[Path, ...]:
+    """Candidate ``Python`` folders (containing ``manus_sdk/``) under an SDK root."""
+
+    candidates = [root, root / "Python"]
+    vendor = root / "vendor"
+    if vendor.is_dir():
+        releases = sorted(
+            (path for path in vendor.glob("ManusSDK_v*") if path.is_dir()),
+            key=lambda path: _release_version(path.name),
+            reverse=True,
+        )
+        candidates.extend(release / "Python" for release in releases)
+    return tuple(dict.fromkeys(path.resolve() for path in candidates))
+
+
+def discover_manus_python_sdk(explicit_root: str | Path | None = None) -> Path:
+    """Find the MANUS Core 3.2 Python SDK folder (the one holding ``manus_sdk/``).
+
+    Returns the directory to put on ``sys.path`` of the bridge process. When
+    the package is already installed in this interpreter (``pip install
+    <SDK>/Python``) no folder is required; callers treat the
+    :class:`SourceUnavailableError` as "rely on the installed package".
+    """
+
+    searched: list[Path] = []
+    for root in _candidate_manus_roots(explicit_root):
+        if not root.is_dir():
+            searched.append(root)
+            continue
+        for candidate in _python_sdk_directories(root):
+            searched.append(candidate)
+            if (candidate / "manus_sdk" / "__init__.py").is_file():
+                return candidate
+    locations = "\n".join(f"  - {path}" for path in searched)
+    raise SourceUnavailableError(
+        "Could not find the MANUS Core 3.2 Python SDK (a 'Python' folder containing "
+        "manus_sdk/__init__.py from MANUS_Core_3.2.x_SDK_Linux.tar.gz). Set MANUS_SDK_ROOT, "
+        "pass sdk_root, or pip install that folder. Searched:\n" + locations
+    )
+
+
+def manus_python_sdk_importable() -> bool:
+    """Whether ``manus_sdk`` is installed in this interpreter."""
+
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("manus_sdk") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _native_bridge_directory() -> Path:
@@ -749,6 +906,7 @@ class ManusIntegratedSource:
         bridge_command: Sequence[str] | None = None,
         sdk_root: str | Path | None = None,
         auto_build: bool = True,
+        backend: str = "native",
         mode: str = "integrated",
         core_host: str | None = None,
         loopback_only: bool = False,
@@ -770,9 +928,45 @@ class ManusIntegratedSource:
         tracker_stale_timeout: float = 0.25,
         expected_tracker_id: str | None = None,
         expected_tracker_user_id: int | None = None,
+        expected_tracker_system: str | None = None,
+        tracker_feed: str = "none",
+        vive_ultimate_socket: str | Path = VUT_DEFAULT_SOCKET,
+        vive_ultimate_frame: str = VUT_DEFAULT_FRAME,
+        wrist_composition: str = "bridge",
+        tracker_to_wrist: RigidTransform | None = None,
+        tracker_to_casing: RigidTransform | None = None,
+        haptics: bool = False,
+        sdk_python_path: str | Path | None = None,
     ) -> None:
         if bridge_command is not None and bridge_executable is not None:
             raise ValueError("Specify bridge_command or bridge_executable, not both")
+        self.backend = _validate_backend(backend)
+        self.tracker_feed = _validate_tracker_feed(tracker_feed)
+        self.wrist_composition = _validate_wrist_composition(wrist_composition)
+        if vive_ultimate_frame not in VUT_FRAMES:
+            raise ValueError(
+                f"vive_ultimate_frame must be one of {VUT_FRAMES}, got {vive_ultimate_frame!r}"
+            )
+        self.vive_ultimate_socket = str(vive_ultimate_socket)
+        self.vive_ultimate_frame = str(vive_ultimate_frame)
+        if tracker_to_wrist is not None and not isinstance(tracker_to_wrist, RigidTransform):
+            raise TypeError("tracker_to_wrist must be a RigidTransform or None")
+        if tracker_to_casing is not None and not isinstance(tracker_to_casing, RigidTransform):
+            raise TypeError("tracker_to_casing must be a RigidTransform or None")
+        self.tracker_to_wrist = tracker_to_wrist
+        self.tracker_to_casing = tracker_to_casing
+        self.haptics_enabled = bool(haptics)
+        self._sdk_python_path = (
+            None if sdk_python_path is None else Path(sdk_python_path).expanduser()
+        )
+        if bridge_executable is not None and self.backend == "python":
+            raise ValueError("bridge_executable applies to the native backend only")
+        if self.tracker_feed != "none" and bridge_command is None and self.backend != "python":
+            raise ValueError(
+                "A VIVE Ultimate tracker feed requires the python MANUS backend"
+            )
+        if self.haptics_enabled and bridge_command is None and self.backend != "python":
+            raise ValueError("MANUS haptics require the python MANUS backend")
         if startup_timeout <= 0.0:
             raise ValueError("startup_timeout must be positive")
         if connect_timeout < 0 or glove_timeout < 0 or reconnect_timeout < 0:
@@ -798,10 +992,19 @@ class ManusIntegratedSource:
                 f"Invalid required MANUS handedness: {required_handedness!r}"
             ) from error
         self.mode = _validate_mode(mode)
+        if self.tracker_feed != "none" and self.mode != "integrated":
+            raise ValueError(
+                "A VIVE Ultimate tracker feed is only valid in Integrated mode; "
+                "Remote Core supplies its own trackers"
+            )
         self.hand_motion = _validate_hand_motion(
             hand_motion
             if hand_motion is not None
-            else ("tracker" if self.mode == "remote" else "auto")
+            else (
+                "tracker"
+                if self.mode == "remote" or self.tracker_feed != "none"
+                else "auto"
+            )
         )
         if core_host is not None and (
             not isinstance(core_host, str) or not core_host.strip()
@@ -814,7 +1017,7 @@ class ManusIntegratedSource:
         # local-only discovery behavior. Remote may discover the Windows host.
         self.loopback_only = self.mode == "integrated" or bool(loopback_only)
         self.tracker_diagnostics_enabled = (
-            self.mode == "remote"
+            (self.mode == "remote" or self.tracker_feed != "none")
             if tracker_diagnostics is None
             else bool(tracker_diagnostics)
         )
@@ -886,12 +1089,21 @@ class ManusIntegratedSource:
             None if expected_tracker_id is None else expected_tracker_id.strip()
         )
         self._expected_tracker_type = f"{self._required_handedness.value}_hand"
-        self._expected_tracker_system = MANUS_ULTIMATE_TRACKER_SYSTEM
+        if expected_tracker_system is None:
+            expected_tracker_system = (
+                VUT_TRACKING_SYSTEM
+                if self.tracker_feed == "vive_ultimate"
+                else MANUS_ULTIMATE_TRACKER_SYSTEM
+            )
+        if not isinstance(expected_tracker_system, str) or not expected_tracker_system.strip():
+            raise ValueError("expected_tracker_system must be a non-empty string")
+        self._expected_tracker_system = expected_tracker_system.strip()
         self._expected_tracker_user_id = expected_tracker_user_id
         if self.require_tracker_for_wrist:
-            if self.mode != "remote":
+            if self.mode != "remote" and self.tracker_feed == "none":
                 raise ValueError(
-                    "Tracker-gated MANUS wrist control requires Remote mode"
+                    "Tracker-gated MANUS wrist control requires Remote mode or an "
+                    "Integrated VIVE Ultimate tracker feed"
                 )
             if self.hand_motion != "tracker":
                 raise ValueError(
@@ -912,7 +1124,9 @@ class ManusIntegratedSource:
                     "Tracker-gated MANUS wrist control requires an explicit "
                     "expected_tracker_id runtime policy"
                 )
-            if self._expected_tracker_user_id is None:
+            if self._expected_tracker_user_id is None and self.tracker_feed == "none":
+                # With an Integrated tracker feed the bridge reports the Core user
+                # that owns the required glove, and the tracker must belong to it.
                 raise ValueError(
                     "Tracker-gated MANUS wrist control requires an explicit "
                     "expected_tracker_user_id runtime policy"
@@ -963,6 +1177,9 @@ class ManusIntegratedSource:
         self._ready = False
         self._closing = False
         self._process: subprocess.Popen[str] | None = None
+        self._command_stream = None
+        self._command_lock = threading.Lock()
+        self._haptic_command_count = 0
         self._protocol_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._stderr_tail: deque[str] = deque(maxlen=20)
@@ -976,6 +1193,7 @@ class ManusIntegratedSource:
                 text=True,
                 timeout=5.0,
                 check=False,
+                env=self._bridge_environment(),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise SourceUnavailableError(
@@ -1006,9 +1224,44 @@ class ManusIntegratedSource:
             )
         return version
 
+    def _python_bridge_command(self) -> list[str]:
+        """The pure-Python sidecar on the MANUS Core 3.2 Python SDK."""
+
+        command = [sys.executable, "-m", MANUS_PYTHON_BRIDGE_MODULE]
+        sdk_python_path = self._sdk_python_path
+        if sdk_python_path is None and not os.environ.get(
+            "DEX_TELEOP_MANUS_PYTHON_SDK_PATH"
+        ):
+            try:
+                sdk_python_path = discover_manus_python_sdk(self._sdk_root)
+            except SourceUnavailableError:
+                if not manus_python_sdk_importable():
+                    raise
+                sdk_python_path = None
+        if sdk_python_path is not None:
+            if not (sdk_python_path / "manus_sdk" / "__init__.py").is_file():
+                raise SourceUnavailableError(
+                    f"MANUS Python SDK folder {sdk_python_path} does not contain manus_sdk/"
+                )
+            command.extend(("--sdk-python-path", str(sdk_python_path)))
+        return command
+
+    def _bridge_environment(self) -> dict[str, str]:
+        """Make this package importable by a ``python -m`` sidecar."""
+
+        environment = dict(os.environ)
+        package_root = str(Path(__file__).resolve().parents[2])
+        existing = environment.get("PYTHONPATH", "")
+        entries = [entry for entry in existing.split(os.pathsep) if entry]
+        if package_root not in entries:
+            environment["PYTHONPATH"] = os.pathsep.join([package_root, *entries])
+        return environment
+
     def _resolve_command(self) -> list[str]:
         if self._bridge_command is not None:
             command = list(self._bridge_command)
+        elif self.backend == "python":
+            command = self._python_bridge_command()
         else:
             executable = self._bridge_executable
             if executable is None:
@@ -1044,6 +1297,16 @@ class ManusIntegratedSource:
         protocol_version = self._probe_bridge_protocol(command)
         self._probed_protocol_version = protocol_version
         self._negotiated_capabilities = _protocol_capabilities(protocol_version)
+        if self.tracker_feed != "none" and "injected_tracker_feed" not in self._negotiated_capabilities:
+            raise SourceUnavailableError(
+                "The selected MANUS bridge cannot inject a VIVE Ultimate tracker feed; "
+                "use the python backend (MANUS Core 3.2 Python SDK)"
+            )
+        if self.haptics_enabled and "haptic_commands" not in self._negotiated_capabilities:
+            raise SourceUnavailableError(
+                "The selected MANUS bridge does not accept haptic commands; "
+                "use the python backend (MANUS Core 3.2 Python SDK)"
+            )
 
         command.extend(
             [
@@ -1064,7 +1327,7 @@ class ManusIntegratedSource:
                 else "--no-tracker-diagnostics",
             ]
         )
-        if protocol_version >= MANUS_PROTOCOL_VERSION:
+        if protocol_version >= MANUS_NATIVE_PROTOCOL_VERSION:
             command.extend(("--required-hand", self._required_handedness.value))
         if self.core_host is not None:
             command.extend(("--core-host", self.core_host))
@@ -1085,6 +1348,38 @@ class ManusIntegratedSource:
                         f"MANUS {side.value} calibration file does not exist: {path}"
                     )
                 command.extend((option, str(path)))
+        if protocol_version >= MANUS_PROTOCOL_VERSION:
+            if self.tracker_feed != "none":
+                command.extend(
+                    (
+                        "--tracker-feed",
+                        self.tracker_feed,
+                        "--vive-ultimate-socket",
+                        self.vive_ultimate_socket,
+                        "--vive-ultimate-frame",
+                        self.vive_ultimate_frame,
+                        "--wrist-composition",
+                        self.wrist_composition,
+                        "--tracker-stale-timeout",
+                        f"{self._tracker_stale_timeout:g}",
+                    )
+                )
+                if self._expected_tracker_id is not None:
+                    command.extend(("--tracker-id", self._expected_tracker_id))
+                if self._expected_tracker_user_id is not None:
+                    command.extend(("--tracker-user-id", str(self._expected_tracker_user_id)))
+                for option, transform in (
+                    ("--tracker-to-wrist", self.tracker_to_wrist),
+                    ("--tracker-to-casing", self.tracker_to_casing),
+                ):
+                    if transform is None:
+                        continue
+                    command.append(f"{option}-translation")
+                    command.extend(f"{value:.9g}" for value in transform.translation)
+                    command.append(f"{option}-rotation-xyzw")
+                    command.extend(f"{value:.9g}" for value in transform.quaternion_xyzw)
+            if self.haptics_enabled:
+                command.append("--haptics")
         return command
 
     def start(self) -> None:
@@ -1129,6 +1424,8 @@ class ManusIntegratedSource:
             self._error = None
             self._ready = False
             self._closing = False
+            self._haptic_command_count = 0
+            self._command_stream = None
 
         command = self._resolve_command()
         executable = Path(command[0]).expanduser()
@@ -1150,12 +1447,13 @@ class ManusIntegratedSource:
         try:
             process = subprocess.Popen(
                 [*command, "--protocol-fd", str(write_fd)],
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if self.haptics_enabled else subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
                 close_fds=True,
                 pass_fds=(write_fd,),
+                env=self._bridge_environment(),
             )
         except OSError as error:
             os.close(read_fd)
@@ -1166,6 +1464,7 @@ class ManusIntegratedSource:
         os.close(write_fd)
         with self._condition:
             self._process = process
+            self._command_stream = process.stdin if self.haptics_enabled else None
         self._protocol_thread = threading.Thread(
             target=self._protocol_loop,
             args=(read_fd,),
@@ -1276,6 +1575,19 @@ class ManusIntegratedSource:
             )
         else:
             tracker = matches[0]
+            expected_user_id = self._expected_tracker_user_id
+            user_reason = (
+                f"tracker user {tracker.get('user_id')!r} != {expected_user_id!r}"
+            )
+            if expected_user_id is None and self.tracker_feed != "none":
+                # The bridge reports which Core user owns the required glove; the
+                # injected tracker must be assigned to that same user.
+                expected_user_id = self._bridge_metadata.get("required_glove_user_id")
+                user_reason = (
+                    "the Core user owning the required glove is not known yet"
+                    if expected_user_id is None
+                    else f"tracker user {tracker.get('user_id')!r} != glove owner {expected_user_id!r}"
+                )
             checks = (
                 (tracker.get("is_hmd") is False, "selected device is an HMD"),
                 (
@@ -1293,10 +1605,9 @@ class ManusIntegratedSource:
                     f"tracker quality is {tracker.get('quality')!r}",
                 ),
                 (
-                    self._expected_tracker_user_id is None
-                    or tracker.get("user_id") == self._expected_tracker_user_id,
-                    f"tracker user {tracker.get('user_id')!r} != "
-                    f"{self._expected_tracker_user_id!r}",
+                    (self._expected_tracker_user_id is None and self.tracker_feed == "none")
+                    or (expected_user_id is not None and tracker.get("user_id") == expected_user_id),
+                    user_reason,
                 ),
             )
             reason = next((message for ok, message in checks if not ok), None)
@@ -1369,13 +1680,10 @@ class ManusIntegratedSource:
                 f"Unexpected MANUS protocol: {payload.get('protocol')!r}"
             )
         protocol_version = payload.get("version")
-        if protocol_version not in (
-            MANUS_LEGACY_PROTOCOL_VERSION,
-            MANUS_PROTOCOL_VERSION,
-        ):
+        if protocol_version not in MANUS_SUPPORTED_PROTOCOL_VERSIONS:
             raise ManusProtocolError(
                 f"Unsupported MANUS protocol version {protocol_version!r}; "
-                f"expected {MANUS_LEGACY_PROTOCOL_VERSION} or {MANUS_PROTOCOL_VERSION}"
+                f"expected one of {MANUS_SUPPORTED_PROTOCOL_VERSIONS}"
             )
         if (
             protocol_version == MANUS_LEGACY_PROTOCOL_VERSION
@@ -1386,7 +1694,7 @@ class ManusIntegratedSource:
                 "Remote requires connection-generation ordering from protocol v2"
             )
         event_generation = None
-        if protocol_version == MANUS_PROTOCOL_VERSION:
+        if protocol_version >= MANUS_NATIVE_PROTOCOL_VERSION:
             event_generation = _require_int(
                 payload.get("connection_generation"),
                 "event.connection_generation",
@@ -1459,6 +1767,10 @@ class ManusIntegratedSource:
                     "session_id",
                     "hand_motion",
                     "core_world_frame",
+                    "wrist_composition",
+                    "tracker_feed",
+                    "required_glove_user_id",
+                    "tracker_to_wrist",
                 ):
                     if key in payload:
                         self._bridge_metadata[key] = payload[key]
@@ -1929,6 +2241,61 @@ class ManusIntegratedSource:
         with self._condition:
             return self._diagnostics.get(Handedness(handedness))
 
+    # -- haptics ---------------------------------------------------------------
+
+    @property
+    def supports_haptics(self) -> bool:
+        """Whether this source relays vibrate commands to a Metaglove Pro Haptic.
+
+        Haptics are opted into at construction; ``start()`` refuses a bridge
+        that lacks the ``haptic_commands`` capability, so after a successful
+        start this also means the sidecar accepts them.
+        """
+
+        return self.haptics_enabled
+
+    def _send_command(self, command: Mapping[str, Any]) -> bool:
+        with self._command_lock:
+            stream = self._command_stream
+            if stream is None:
+                return False
+            try:
+                stream.write(json.dumps(command, separators=(",", ":"), allow_nan=False) + "\n")
+                stream.flush()
+            except (BrokenPipeError, OSError, ValueError) as error:
+                self._command_stream = None
+                self._set_error(
+                    RuntimeError(f"MANUS bridge stopped accepting haptic commands: {error}")
+                )
+                return False
+        return True
+
+    def vibrate_fingers(
+        self, handedness: Handedness | str, powers: Sequence[float]
+    ) -> bool:
+        """Drive the five finger actuators (thumb..pinky, each 0..1) of one glove.
+
+        Returns ``False`` when haptics are disabled for this source. The bridge
+        keeps the last amplitudes until the next command, so send zeros to stop.
+        """
+
+        if not self.haptics_enabled:
+            return False
+        side = Handedness(handedness)
+        values = [float(value) for value in powers]
+        if len(values) != 5 or not all(np.isfinite(values)):
+            raise ValueError("MANUS haptic powers must be five finite values")
+        values = [min(1.0, max(0.0, value)) for value in values]
+        sent = self._send_command({"type": "vibrate", "side": side.value, "powers": values})
+        if sent:
+            with self._condition:
+                self._haptic_command_count += 1
+        return sent
+
+    def stop_haptics(self) -> None:
+        if self.haptics_enabled:
+            self._send_command({"type": "stop_haptics"})
+
     def tracker_diagnostics(self) -> ManusTrackerDiagnostics | None:
         with self._condition:
             return self._tracker_diagnostics
@@ -1953,9 +2320,28 @@ class ManusIntegratedSource:
             {
                 "provider": f"MANUS SDK {self.mode.title()}",
                 "mode": self.mode,
+                "backend": self.backend,
                 "requested_core_host": self.core_host,
                 "loopback_only": self.loopback_only,
                 "hand_motion": self.hand_motion,
+                "tracker_feed": self.tracker_feed,
+                "vive_ultimate_socket": (
+                    self.vive_ultimate_socket if self.tracker_feed == "vive_ultimate" else None
+                ),
+                "vive_ultimate_frame": (
+                    self.vive_ultimate_frame if self.tracker_feed == "vive_ultimate" else None
+                ),
+                "requested_wrist_composition": (
+                    self.wrist_composition if self.tracker_feed != "none" else "core"
+                ),
+                "requested_tracker_to_wrist": (
+                    None if self.tracker_to_wrist is None else self.tracker_to_wrist.as_mapping()
+                ),
+                "requested_tracker_to_casing": (
+                    None if self.tracker_to_casing is None else self.tracker_to_casing.as_mapping()
+                ),
+                "haptics_enabled": self.haptics_enabled,
+                "haptic_command_count": self._haptic_command_count,
                 "bridge_protocol_version": protocol_version,
                 "supported_protocol_version": MANUS_PROTOCOL_VERSION,
                 "bridge_capabilities": capabilities,
@@ -2025,6 +2411,16 @@ class ManusIntegratedSource:
             self._closing = True
             process = self._process
             self._condition.notify_all()
+        if process is not None and process.poll() is None and self.haptics_enabled:
+            # Leave the glove silent before the sidecar goes away.
+            self._send_command({"type": "stop_haptics"})
+        with self._command_lock:
+            stream, self._command_stream = self._command_stream, None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -2055,11 +2451,17 @@ ManusSource = ManusIntegratedSource
 
 __all__ = [
     "MANUS_ARTICULATION_SCHEMA",
+    "MANUS_BACKENDS",
     "MANUS_HAND_MOTIONS",
     "MANUS_JOINT_NAMES",
     "MANUS_MODES",
+    "MANUS_NATIVE_PROTOCOL_VERSION",
     "MANUS_PROTOCOL",
     "MANUS_PROTOCOL_VERSION",
+    "MANUS_PYTHON_BRIDGE_MODULE",
+    "MANUS_SUPPORTED_PROTOCOL_VERSIONS",
+    "MANUS_TRACKER_FEEDS",
+    "MANUS_WRIST_COMPOSITIONS",
     "ManusFrameDiagnostics",
     "ManusIntegratedSource",
     "ManusProtocolError",
@@ -2068,5 +2470,7 @@ __all__ = [
     "ManusTrackerDiagnostics",
     "build_manus_bridge",
     "default_manus_bridge_path",
+    "discover_manus_python_sdk",
     "discover_manus_sdk",
+    "manus_python_sdk_importable",
 ]

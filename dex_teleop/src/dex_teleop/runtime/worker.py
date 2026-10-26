@@ -8,7 +8,7 @@ import math
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Mapping, Sequence, TYPE_CHECKING
 
 from dex_teleop.retargeting import HandRetargeter, ObservationRetargeter
 from dex_teleop.tracking import (
@@ -48,6 +48,9 @@ class RetargetingSnapshot:
     synchronization_skew_seconds: float | None = None
     native_wrist_stream: str | None = None
     native_wrist_row: int | None = None
+    # Raw records behind ``frame`` when one source produced both components
+    # (HTS), captured at publication while the source still holds them.
+    source_diagnostics: Any = None
 
     def action_selection(self) -> ActionHandSelection | None:
         """Return the exact recording rows used for this command, if attached."""
@@ -190,13 +193,83 @@ def _sample_identity(sample: HandArticulationSample | WristPoseSample) -> tuple:
     return ("capture", round(sample.timestamp * 1e9))
 
 
-class MultiSourceTrackingWorker:
+class _SelectedRoleChecks:
+    """Staleness messages shared by the in-process and child-process workers.
+
+    Requires ``articulation_source``, ``wrist_source``, ``_articulation_keys``
+    and ``_wrist_keys``.
+    """
+
+    def _role_label(self, modality: str, key: str) -> str:
+        selected = (
+            key == self.articulation_source
+            if modality == "articulation"
+            else key == self.wrist_source
+        )
+        return f"{'selected' if selected else 'record-only'} {modality} source {key!r}"
+
+    def _raise_if_snapshot_stale(
+        self, latest: RetargetingSnapshot, maximum_age: float
+    ) -> None:
+        assert latest.observation is not None
+        now = time.monotonic()
+        components = (
+            (
+                self._role_label("articulation", self.articulation_source),
+                latest.observation.articulation.receipt_timestamp,
+            ),
+            (
+                self._role_label("wrist", self.wrist_source),
+                latest.observation.wrist.receipt_timestamp,
+            ),
+        )
+        for label, receipt_timestamp in components:
+            age = now - receipt_timestamp
+            if age > maximum_age:
+                raise SourceUnavailableError(
+                    f"{label.capitalize()} is stale ({age:.3f}s > {maximum_age:.3f}s)"
+                )
+
+    def _raise_if_streams_stale(
+        self, receipts: Mapping[tuple[str, str], float], maximum_age: float
+    ) -> None:
+        now = time.monotonic()
+        problems = []
+        for modality, keys in (
+            ("articulation", self._articulation_keys),
+            ("wrist", self._wrist_keys),
+        ):
+            for key in keys:
+                label = self._role_label(modality, key)
+                receipt = receipts.get((modality, key))
+                if receipt is None:
+                    problems.append(f"{label} has not produced a sample")
+                    continue
+                age = now - receipt
+                if age > maximum_age:
+                    problems.append(
+                        f"{label} is stale ({age:.3f}s > {maximum_age:.3f}s)"
+                    )
+        if problems:
+            raise SourceUnavailableError(
+                "Hand-tracking stream freshness check failed: " + "; ".join(problems)
+            )
+
+
+class MultiSourceTrackingWorker(_SelectedRoleChecks):
     """Fuse explicitly selected hand and wrist sources in one worker thread.
 
     The registry key is configuration identity; ``sample.source`` remains
     device provenance. Selected sources are never replaced by record-only
     sources. A physical receiver registered for both modalities is started,
     health-checked, and closed exactly once by object identity.
+
+    With ``retarget_once_per_snapshot`` a new articulation is retargeted only
+    after the previous command has been read with :meth:`snapshot`, so a
+    control loop that reads once per step gets at most one retarget per step,
+    always of the newest sample. An unread command blocks retargeting for at
+    most ``unread_command_lifetime`` seconds, so a loop that pauses reading
+    never resumes with a stale command. Every native sample is still recorded.
     """
 
     def __init__(
@@ -216,9 +289,13 @@ class MultiSourceTrackingWorker:
         poll_interval: float = 0.002,
         recording_session: HandTrackingRecordingSession | None = None,
         retargeter_name: str | None = None,
+        retarget_once_per_snapshot: bool = False,
+        unread_command_lifetime: float = 0.1,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
+        if not unread_command_lifetime > 0:
+            raise ValueError("unread_command_lifetime must be positive")
         if not sources:
             raise ValueError("sources must contain at least one named source")
         normalized_sources: dict[str, object] = {}
@@ -265,6 +342,8 @@ class MultiSourceTrackingWorker:
         self.retargeter = retargeter
         self.handedness = Handedness(handedness)
         self.poll_interval = float(poll_interval)
+        self.retarget_once_per_snapshot = bool(retarget_once_per_snapshot)
+        self.unread_command_lifetime = float(unread_command_lifetime)
         self.fuser = fuser or HandObservationFuser(
             maximum_skew_seconds=maximum_skew_seconds,
             interpolate_wrist=interpolate_wrist,
@@ -310,6 +389,10 @@ class MultiSourceTrackingWorker:
         self._closed = False
         self._started_sources: list[tuple[object, str]] = []
         self._latest: RetargetingSnapshot | None = None
+        self._latest_consumed = False
+        self._latest_published_at = 0.0
+        # Called on the worker thread with every published snapshot.
+        self.publish_listener: Callable[[RetargetingSnapshot], None] | None = None
         self._error: BaseException | None = None
         self._recording_session = recording_session
 
@@ -404,14 +487,6 @@ class MultiSourceTrackingWorker:
     def _lifecycle_label(self, source: object) -> str:
         return ", ".join(self._roles_for_object(source))
 
-    def _role_label(self, modality: str, key: str) -> str:
-        selected = (
-            key == self.articulation_source
-            if modality == "articulation"
-            else key == self.wrist_source
-        )
-        return f"{'selected' if selected else 'record-only'} {modality} source {key!r}"
-
     def start(self) -> None:
         if self._start_attempted:
             raise RuntimeError("MultiSourceTrackingWorker has already been started")
@@ -451,25 +526,12 @@ class MultiSourceTrackingWorker:
         self.check_health()
         with self._lock:
             latest = self._latest
+            if latest is not None:
+                self._latest_consumed = True
+        if latest is not None and self.retarget_once_per_snapshot:
+            self._wake.set()
         if latest is not None and maximum_age is not None:
-            assert latest.observation is not None
-            now = time.monotonic()
-            components = (
-                (
-                    self._role_label("articulation", self.articulation_source),
-                    latest.observation.articulation.receipt_timestamp,
-                ),
-                (
-                    self._role_label("wrist", self.wrist_source),
-                    latest.observation.wrist.receipt_timestamp,
-                ),
-            )
-            for label, receipt_timestamp in components:
-                age = now - receipt_timestamp
-                if age > maximum_age:
-                    raise SourceUnavailableError(
-                        f"{label.capitalize()} is stale ({age:.3f}s > {maximum_age:.3f}s)"
-                    )
+            self._raise_if_snapshot_stale(latest, maximum_age)
         return latest
 
     def wait_for_first(self, timeout: float) -> RetargetingSnapshot:
@@ -477,27 +539,7 @@ class MultiSourceTrackingWorker:
             raise ValueError("timeout must be non-negative")
         if not self._first.wait(timeout=timeout):
             self.check_health()
-            with self._lock:
-                missing = [
-                    self._role_label("articulation", key)
-                    for key in self._articulation_keys
-                    if key not in self._seen_articulation_sources
-                ]
-                missing.extend(
-                    self._role_label("wrist", key)
-                    for key in self._wrist_keys
-                    if key not in self._seen_wrist_sources
-                )
-            missing_detail = (
-                "; missing initial samples from " + ", ".join(missing)
-                if missing
-                else "; all configured streams produced samples, but no in-skew fused observation was available"
-            )
-            raise SourceUnavailableError(
-                f"No ready fused {self.handedness.value}-hand observation received within {timeout:.1f}s "
-                f"from selected articulation source {self.articulation_source!r} and "
-                f"selected wrist source {self.wrist_source!r}{missing_detail}"
-            )
+            raise SourceUnavailableError(self._first_timeout_message(timeout))
         snapshot = self.snapshot()
         if snapshot is None:
             self.check_health()
@@ -505,6 +547,29 @@ class MultiSourceTrackingWorker:
                 "Worker signaled without publishing a fused observation"
             )
         return snapshot
+
+    def _first_timeout_message(self, timeout: float) -> str:
+        with self._lock:
+            missing = [
+                self._role_label("articulation", key)
+                for key in self._articulation_keys
+                if key not in self._seen_articulation_sources
+            ]
+            missing.extend(
+                self._role_label("wrist", key)
+                for key in self._wrist_keys
+                if key not in self._seen_wrist_sources
+            )
+        missing_detail = (
+            "; missing initial samples from " + ", ".join(missing)
+            if missing
+            else "; all configured streams produced samples, but no in-skew fused observation was available"
+        )
+        return (
+            f"No ready fused {self.handedness.value}-hand observation received within {timeout:.1f}s "
+            f"from selected articulation source {self.articulation_source!r} and "
+            f"selected wrist source {self.wrist_source!r}{missing_detail}"
+        )
 
     def check_health(self) -> None:
         with self._lock:
@@ -527,29 +592,49 @@ class MultiSourceTrackingWorker:
         if not math.isfinite(maximum_age) or maximum_age < 0.0:
             raise ValueError("maximum_age must be finite and non-negative")
         self.check_health()
-        now = time.monotonic()
         with self._lock:
             receipts = dict(self._stream_last_receipt)
-        problems = []
-        for modality, keys in (
-            ("articulation", self._articulation_keys),
-            ("wrist", self._wrist_keys),
-        ):
-            for key in keys:
-                label = self._role_label(modality, key)
-                receipt = receipts.get((modality, key))
-                if receipt is None:
-                    problems.append(f"{label} has not produced a sample")
-                    continue
-                age = now - receipt
-                if age > maximum_age:
-                    problems.append(
-                        f"{label} is stale ({age:.3f}s > {maximum_age:.3f}s)"
-                    )
-        if problems:
-            raise SourceUnavailableError(
-                "Hand-tracking stream freshness check failed: " + "; ".join(problems)
-            )
+        self._raise_if_streams_stale(receipts, maximum_age)
+
+    def query(self, function: Callable[..., Any], *args: Any) -> Any:
+        """Return ``function(worker, *args)`` evaluated where the sources live.
+
+        Launchers read source metadata this way so the same call works when the
+        worker runs in a child process (``function`` must then be importable
+        and its result picklable).
+        """
+
+        return function(self, *args)
+
+    @property
+    def haptic_sources(self) -> tuple[str, ...]:
+        """Registry keys of sources that can vibrate a glove (``vibrate_fingers``)."""
+
+        return tuple(
+            key
+            for key, source in self.sources.items()
+            if callable(getattr(source, "vibrate_fingers", None))
+            and getattr(source, "supports_haptics", False)
+        )
+
+    def apply_haptic_feedback(self, handedness, amplitudes: Sequence[float]) -> bool:
+        """Send five finger amplitudes (thumb..pinky, 0..1) to every haptic-capable source.
+
+        Returns ``True`` when at least one source accepted the command. This is
+        fire-and-forget: a dead sidecar is reported through ``check_health``.
+        """
+
+        accepted = False
+        for key in self.haptic_sources:
+            accepted = bool(self.sources[key].vibrate_fingers(handedness, amplitudes)) or accepted
+        return accepted
+
+    def _tracking_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "receipts": dict(self._stream_last_receipt),
+                "first": self._first.is_set(),
+            }
 
     @property
     def recording_session(self) -> HandTrackingRecordingSession | None:
@@ -911,8 +996,10 @@ class MultiSourceTrackingWorker:
                     # one pending sample without resetting its bounded
                     # interpolation deadline. Keep only the newest sample from
                     # this native batch as the deferred control candidate.
+                    # While the previous command is unread, nothing is
+                    # published, so the newest sample replaces the pending one.
                     sample, row = newest_selected
-                    if self._pending_articulation is None:
+                    if self._pending_articulation is None or self._awaiting_consumer():
                         self._pending_articulation = (
                             sample,
                             row,
@@ -957,10 +1044,22 @@ class MultiSourceTrackingWorker:
         row = session.append_wrist(self.control_wrist_stream, control_sample)
         return self.control_wrist_stream, row, None, None
 
+    def _awaiting_consumer(self) -> bool:
+        if not self.retarget_once_per_snapshot:
+            return False
+        with self._lock:
+            return (
+                self._latest is not None
+                and not self._latest_consumed
+                and time.monotonic() - self._latest_published_at
+                < self.unread_command_lifetime
+            )
+
     def _publish_pending(self) -> None:
         if (
             self._pending_articulation is None
             or self._selected_wrist_source_name is None
+            or self._awaiting_consumer()
         ):
             return
         articulation, articulation_row, interpolation_deadline = (
@@ -1026,6 +1125,13 @@ class MultiSourceTrackingWorker:
                     wrist_row=wrist_row,
                 ),
             )
+        source_diagnostics = None
+        if self.articulation_source == self.wrist_source:
+            diagnostics_for_frame = getattr(
+                self.sources[self.articulation_source], "diagnostics_for_frame", None
+            )
+            if callable(diagnostics_for_frame):
+                source_diagnostics = diagnostics_for_frame(frame)
         snapshot = RetargetingSnapshot(
             frame=frame,
             command=command,
@@ -1043,10 +1149,15 @@ class MultiSourceTrackingWorker:
             ),
             native_wrist_stream=native_wrist_stream,
             native_wrist_row=native_wrist_row,
+            source_diagnostics=source_diagnostics,
         )
         with self._lock:
             self._latest = snapshot
+            self._latest_consumed = False
+            self._latest_published_at = time.monotonic()
         self._maybe_signal_first()
+        if self.publish_listener is not None:
+            self.publish_listener(snapshot)
         if self._deferred_articulation is not None:
             sample, row = self._deferred_articulation
             self._deferred_articulation = None

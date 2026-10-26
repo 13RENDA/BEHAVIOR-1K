@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ from dex_teleop.retargeting import LandmarkRetargeter
 from dex_teleop.tracking.manus import (
     MANUS_ARTICULATION_SCHEMA,
     MANUS_JOINT_NAMES,
+    MANUS_PROTOCOL_VERSION,
     ManusIntegratedSource,
     _native_bridge_directory,
     build_manus_bridge,
@@ -340,7 +342,7 @@ def test_actual_v1_cli_omits_v2_flags_and_records_negotiated_version(tmp_path):
         metadata = source.recording_metadata()
 
     assert metadata["bridge_protocol_version"] == 1
-    assert metadata["supported_protocol_version"] == 2
+    assert metadata["supported_protocol_version"] == MANUS_PROTOCOL_VERSION
     assert metadata["protocol_version_history"] == [1]
     assert metadata["protocol_version_changes_allowed"] is False
     assert metadata["bridge_capabilities"] == [
@@ -353,8 +355,8 @@ def test_actual_v1_cli_omits_v2_flags_and_records_negotiated_version(tmp_path):
     wrist = batch.wrists[0]
     assert articulation.provenance["bridge_protocol_version"] == 1
     assert wrist.provenance["bridge_protocol_version"] == 1
-    assert articulation.provenance["supported_protocol_version"] == 2
-    assert wrist.provenance["supported_protocol_version"] == 2
+    assert articulation.provenance["supported_protocol_version"] == MANUS_PROTOCOL_VERSION
+    assert wrist.provenance["supported_protocol_version"] == MANUS_PROTOCOL_VERSION
     assert json.loads(articulation.provenance["protocol_version_history"]) == [1]
     assert json.loads(wrist.provenance["protocol_version_history"]) == [1]
     assert (
@@ -385,7 +387,7 @@ def test_actual_v1_cli_omits_v2_flags_and_records_negotiated_version(tmp_path):
         assert json.loads(stored.attrs["metadata"])["bridge_protocol_version"] == 1
         provenance = json.loads(stored["provenance_json"][0])
         assert provenance["bridge_protocol_version"] == 1
-        assert provenance["supported_protocol_version"] == 2
+        assert provenance["supported_protocol_version"] == MANUS_PROTOCOL_VERSION
         assert json.loads(provenance["protocol_version_history"]) == [1]
 
 
@@ -720,8 +722,8 @@ def test_manus_remote_reconnect_clears_stale_state_and_resumes_pairs():
         articulation = resumed.articulations[0]
         wrist = resumed.wrists[0]
         assert wrist.provenance["connection_generation"] == 2
-        assert articulation.provenance["supported_protocol_version"] == 2
-        assert wrist.provenance["supported_protocol_version"] == 2
+        assert articulation.provenance["supported_protocol_version"] == MANUS_PROTOCOL_VERSION
+        assert wrist.provenance["supported_protocol_version"] == MANUS_PROTOCOL_VERSION
         assert json.loads(articulation.provenance["protocol_version_history"]) == [2]
         assert json.loads(wrist.provenance["protocol_version_history"]) == [2]
         assert (
@@ -1045,9 +1047,9 @@ def test_manus_remote_runtime_helper_records_strict_provenance_and_manifest():
 
 
 def test_manus_sdk_discovery_finds_installed_3_1_1_layout():
-    setup_root = Path.home() / "manus_setup"
+    setup_root = Path.home() / "manus_setup/vendor/ManusSDK_v3.1.1"
     if not setup_root.is_dir():
-        pytest.skip("Official MANUS SDK installation is not present on this host")
+        pytest.skip("Official MANUS SDK v3.1.1 installation is not present on this host")
 
     layout = discover_manus_sdk(setup_root)
 
@@ -1056,6 +1058,68 @@ def test_manus_sdk_discovery_finds_installed_3_1_1_layout():
     assert layout.integrated_library.is_file()
     assert layout.remote_library.name == "libManusSDK.so"
     assert layout.remote_library.is_file()
+
+
+def _fake_sdk_release(root: Path, version: str) -> Path:
+    if version == "3.1.1":
+        sdk = root / "vendor/ManusSDK_v3.1.1/SDKClient_Linux/ManusSDK"
+        libraries = ("lib/libManusSDK_Integrated.so", "lib/libManusSDK.so")
+    else:
+        sdk = root / f"vendor/ManusSDK_v{version}/C++/SDKClient/ManusSDK"
+        libraries = ("lib/amd64/libManusSDK-amd64.so",)
+    for relative in ("include/ManusSDK.h", *libraries):
+        (sdk / relative).parent.mkdir(parents=True, exist_ok=True)
+        (sdk / relative).write_bytes(b"")
+    return sdk.resolve()
+
+
+def test_manus_sdk_discovery_serves_both_modes_from_the_unified_v3_2_library(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    sdk = _fake_sdk_release(tmp_path, "3.2.1")
+
+    for mode in ("integrated", "remote"):
+        layout = discover_manus_sdk(tmp_path, mode=mode)
+        assert layout.root == sdk
+        assert layout.library_for(mode) == sdk / "lib/amd64/libManusSDK-amd64.so"
+
+
+def test_manus_sdk_discovery_prefers_the_newest_release_unless_one_is_named(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    older = _fake_sdk_release(tmp_path, "3.1.1")
+    newer = _fake_sdk_release(tmp_path, "3.2.1")
+
+    assert discover_manus_sdk(tmp_path, mode="remote").root == newer
+    named = discover_manus_sdk(tmp_path / "vendor/ManusSDK_v3.1.1", mode="remote")
+    assert named.root == older
+    assert named.library_for("remote") == older / "lib/libManusSDK.so"
+
+
+def test_manus_bridge_switches_between_installed_sdk_releases(tmp_path):
+    vendor = Path.home() / "manus_setup/vendor"
+    releases = (vendor / "ManusSDK_v3.1.1", vendor / "ManusSDK_v3.2.1")
+    if not all(release.is_dir() for release in releases):
+        pytest.skip("Official MANUS SDK v3.1.1 and v3.2.1 installations are both required")
+    output = tmp_path / "manus_bridge"
+    runtime_library = tmp_path / "manus_runtime_integrated/libManusSDK.so"
+    bundle_root = tmp_path / ".dex_teleop_manus_bridge_bundles"
+
+    for release in (*releases, releases[0]):
+        expected_library = discover_manus_sdk(release).integrated_library.resolve()
+        build_manus_bridge(sdk_root=release, output=output)
+
+        assert runtime_library.resolve() == expected_library
+        assert len(list(bundle_root.iterdir())) == 1
+        probe = subprocess.run(
+            (str(output), "--protocol-version"),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert probe.stdout.strip() == "dex_teleop.manus 2"
 
 
 def test_manus_bridge_uses_mode_specific_rpath_to_prefer_integrated_runtime(tmp_path):
@@ -1252,9 +1316,9 @@ def test_manus_bridge_refuses_unowned_runtime_link_without_mutation(tmp_path):
 
 
 def test_remote_manus_bridge_uses_isolated_runtime_and_protocol_probe(tmp_path):
-    setup_root = Path.home() / "manus_setup"
+    setup_root = Path.home() / "manus_setup/vendor/ManusSDK_v3.1.1"
     if not setup_root.is_dir():
-        pytest.skip("Official MANUS SDK installation is not present on this host")
+        pytest.skip("Official MANUS SDK v3.1.1 installation is not present on this host")
     cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     runtime_prefix = (
         Path(
@@ -1310,6 +1374,34 @@ def test_remote_manus_bridge_uses_isolated_runtime_and_protocol_probe(tmp_path):
     assert "not found" not in loader.stdout
     for soname in ("libgrpc.so.9", "libgrpc++.so.1", "libprotobuf.so.22"):
         assert f"{soname} => {runtime_prefix}/lib/{soname}" in loader.stdout
+
+
+def test_remote_manus_bridge_on_sdk_v3_2_1_needs_no_separate_runtime(tmp_path):
+    setup_root = Path.home() / "manus_setup/vendor/ManusSDK_v3.2.1"
+    if not setup_root.is_dir():
+        pytest.skip("Official MANUS SDK v3.2.1 installation is not present on this host")
+
+    bridge = build_manus_bridge(
+        sdk_root=setup_root,
+        output=tmp_path / "manus_bridge_remote",
+        mode="remote",
+    )
+
+    probe = subprocess.run(
+        (str(bridge), "--protocol-version"),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert probe.stdout.strip() == "dex_teleop.manus 2"
+    dynamic_section = subprocess.run(
+        ("readelf", "-d", str(bridge)),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "Library rpath: [$ORIGIN/manus_runtime_remote]" in dynamic_section
+    assert "(RUNPATH)" not in dynamic_section
 
 
 def test_manus_source_does_not_retain_multiline_license_data_in_errors():

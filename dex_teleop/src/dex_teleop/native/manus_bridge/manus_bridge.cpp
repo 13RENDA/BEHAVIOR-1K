@@ -546,13 +546,25 @@ std::vector<unsigned char> read_binary_file(const std::string& path)
     return bytes;
 }
 
+// SDK v3.1.1 x86-64 headers take the count by reference; its ARM headers and
+// every v3.2 header take a pointer.
+template <typename NodeCountFunction>
+auto call_raw_skeleton_node_count(NodeCountFunction function, uint32_t glove_id, uint32_t& node_count, int)
+    -> decltype(function(glove_id, &node_count))
+{
+    return function(glove_id, &node_count);
+}
+
+template <typename NodeCountFunction>
+auto call_raw_skeleton_node_count(NodeCountFunction function, uint32_t glove_id, uint32_t& node_count, long)
+    -> decltype(function(glove_id, node_count))
+{
+    return function(glove_id, node_count);
+}
+
 SDKReturnCode raw_skeleton_node_count(uint32_t glove_id, uint32_t& node_count)
 {
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) || defined(_M_ARM)
-    return CoreSdk_GetRawSkeletonNodeCount(glove_id, &node_count);
-#else
-    return CoreSdk_GetRawSkeletonNodeCount(glove_id, node_count);
-#endif
+    return call_raw_skeleton_node_count(CoreSdk_GetRawSkeletonNodeCount, glove_id, node_count, 0);
 }
 
 class Bridge
