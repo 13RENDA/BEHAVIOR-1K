@@ -68,6 +68,7 @@ from dex_teleop.omnigibson.launch_config import (
     add_launch_config_arguments,
     parse_launch_arguments,
 )
+from dex_teleop.omnigibson.teleop_telemetry import WristTelemetry, target_position_world
 from dex_teleop.retargeting import SUPPORTED_RETARGETERS, create_hand_retargeter
 from dex_teleop.runtime import (
     MultiSourceTrackingWorker,
@@ -196,18 +197,15 @@ def _freeze_loaded_heap() -> None:
     gc.freeze()
 
 
-def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    add_launch_config_arguments(parser)
-    selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--task", choices=tuple(catalog.tasks))
-    selection.add_argument("--subscale", choices=tuple(catalog.subscales))
-    parser.add_argument("--list-tasks", action="store_true")
-    parser.add_argument(
-        "--camera-rig",
-        choices=camera_rig_names(),
-        help="Override the task catalog's camera rig for this launch",
-    )
+def add_tracking_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Declare the hand/wrist source, retargeting, HTS, MANUS, and VIVE options.
+
+    Shared by the ARAT launcher and the wrist bench so both accept the same
+    tracking flags and launch presets (``configs/*.yaml``); the helpers
+    ``_resolve_tracking_selection``, ``_validate_manus_selection``,
+    ``_create_tracking_sources`` and ``_create_worker`` read exactly these.
+    """
+
     parser.add_argument(
         "--hand-source",
         choices=TRACKING_SOURCES,
@@ -426,6 +424,22 @@ def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
     parser.add_argument("--manus-glove-timeout", type=int, default=15)
     parser.add_argument("--manus-reconnect-timeout", type=int, default=15)
     parser.add_argument("--manus-discovery-wait", type=int, default=1)
+    return parser
+
+
+def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_launch_config_arguments(parser)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--task", choices=tuple(catalog.tasks))
+    selection.add_argument("--subscale", choices=tuple(catalog.subscales))
+    parser.add_argument("--list-tasks", action="store_true")
+    parser.add_argument(
+        "--camera-rig",
+        choices=camera_rig_names(),
+        help="Override the task catalog's camera rig for this launch",
+    )
+    add_tracking_arguments(parser)
     parser.add_argument(
         "--recording-path",
         help=(
@@ -568,6 +582,16 @@ def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
         help="Single-task step limit; 0 runs until interrupted",
     )
     parser.add_argument(
+        "--engage-after",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Engage (as SPACE would) this long after each task is ready; the only way to engage "
+            "in a headless run"
+        ),
+    )
+    parser.add_argument(
         "--steps-per-task",
         type=int,
         default=3600,
@@ -595,6 +619,15 @@ def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
         type=float,
         default=1.5,
         help="Scale tracked wrist translation about the engagement anchor (default: 1.5)",
+    )
+    parser.add_argument(
+        "--telemetry-interval",
+        type=float,
+        default=1.0,
+        help=(
+            "Seconds between wrist telemetry lines while engaged (tracker quality, motion since "
+            "anchor, target-EEF error, frame age, loop Hz, env.step time); 0 disables them (default: 1.0)"
+        ),
     )
     parser.add_argument(
         "--no-score",
@@ -1829,6 +1862,25 @@ def _reset_and_wait_for_tracking(worker, timeout: float, *, context: str):
         raise SourceUnavailableError(f"{context}: {error}") from error
 
 
+def _attach_recording_and_wait(worker, session, timeout: float):
+    """Attach the native-rate collector, then wait for the first sample fused after it.
+
+    Attaching is a worker boundary like a reset: the snapshot and the stream
+    receipts published before it are discarded so nothing acquired earlier can
+    land in the new session. The control loop's ``check_stream_freshness`` runs
+    right after engagement, so without this wait it would see no post-boundary
+    receipt yet and fail every role with "has not produced a sample".
+    """
+
+    worker.set_recording_session(session)
+    try:
+        return worker.wait_for_first(timeout)
+    except SourceUnavailableError as error:
+        raise SourceUnavailableError(
+            f"Tracking did not resume after attaching the recorder: {error}"
+        ) from error
+
+
 def _run_task(
     task: AratTask,
     worker: TrackingRetargetingWorker | MultiSourceTrackingWorker | ProcessTrackingWorker,
@@ -1966,6 +2018,14 @@ def _run_task(
         print(f"Wrist position sensitivity: {args.position_sensitivity:g}x")
         if args.tracking_yaw_deg:
             print(f"Tracking frame yaw: {args.tracking_yaw_deg:g} degrees")
+        telemetry = (
+            WristTelemetry(args.telemetry_interval) if args.telemetry_interval > 0 else None
+        )
+        if telemetry is not None:
+            print(
+                f"Wrist telemetry every {args.telemetry_interval:g} s while engaged: tracker quality/health, "
+                "motion since anchor, target-EEF error, frame age, loop Hz and env.step time"
+            )
         if not gm.HEADLESS:
             from dex_teleop.omnigibson.workspace_visualization import (
                 ArmPoseMarkerVisualizer,
@@ -2128,7 +2188,9 @@ def _run_task(
             if hand_tracking_session is None or recording_started:
                 return
             _set_hand_tracking_metadata(hand_tracking_session, worker, args)
-            worker.set_recording_session(hand_tracking_session)
+            _attach_recording_and_wait(
+                worker, hand_tracking_session, args.initial_frame_timeout
+            )
             hand_tracking_session.begin_episode()
             recording_started = True
             print(
@@ -2143,6 +2205,8 @@ def _run_task(
             )
             start_recording()
             adapter.request_anchor()
+            if telemetry is not None:
+                telemetry.reset()
             if arm_marker_visualizer is not None:
                 arm_marker_visualizer.reset()
             control["engaged"] = True
@@ -2188,6 +2252,8 @@ def _run_task(
                 )
                 print("ARAT scorer reset; the item restarts from zero task time")
             adapter.request_anchor()
+            if telemetry is not None:
+                telemetry.reset()
             if arm_marker_visualizer is not None:
                 arm_marker_visualizer.reset()
             print("Robot reset; press SPACE to engage teleoperation")
@@ -2241,9 +2307,16 @@ def _run_task(
         previous_goal_status = None
         holding_stale_frame = False
         stale_hold_started = None
+        engage_at = None if args.engage_after is None else time.monotonic() + args.engage_after
+        if engage_at is not None:
+            print(f"Engaging automatically in {args.engage_after:g} s (--engage-after)")
         while (step_limit <= 0 or steps < step_limit) and not (
             shutdown is not None and shutdown.requested
         ):
+            if engage_at is not None and time.monotonic() >= engage_at:
+                engage_at = None
+                if not control["engaged"] and control["pending_command"] is None:
+                    control["pending_command"] = "start_or_anchor"
             pending_command = control["pending_command"]
             control["pending_command"] = None
             if pending_command == "reset":
@@ -2376,20 +2449,42 @@ def _run_task(
             if hand_pose_episodes is not None:
                 source_diagnostics = _source_diagnostics_for_snapshot(worker, snapshot)
             action = adapter.action(snapshot, frozen_fingers=frozen_fingers)
-            action_diagnostics = None
-            if arm_marker_visualizer is not None:
-                # Read this before env.step(): Kit keyboard callbacks are dispatched
-                # while stepping and a re-anchor intentionally clears adapter state.
-                action_diagnostics = adapter.last_wrist_diagnostics
-                if action_diagnostics is None:
-                    raise RuntimeError(
-                        "Sharpa adapter did not expose wrist diagnostics after building an action"
-                    )
+            # Read this before env.step(): Kit keyboard callbacks are dispatched
+            # while stepping and a re-anchor intentionally clears adapter state.
+            action_diagnostics = adapter.last_wrist_diagnostics
+            if action_diagnostics is None:
+                raise RuntimeError(
+                    "Sharpa adapter did not expose wrist diagnostics after building an action"
+                )
             sim_time_before_s = float(og.sim.current_time)
             action_apply_monotonic_ns = time.monotonic_ns()
             _, _, terminated, truncated, info = env.step(action)
             step_return_monotonic_ns = time.monotonic_ns()
             sim_time_after_s = float(og.sim.current_time)
+            if telemetry is not None:
+                sample = telemetry.observe(
+                    now=time.monotonic(),
+                    wrist_position=snapshot.frame.wrist_position,
+                    wrist_quaternion_xyzw=snapshot.frame.wrist_quaternion_xyzw,
+                    frame_receipt_timestamp=snapshot.frame.receipt_timestamp,
+                    wrist_provenance=(
+                        None if snapshot.observation is None else snapshot.observation.wrist.provenance
+                    ),
+                    # Evaluated only when a line is due, so the simulator is not queried every step.
+                    target_position_world=lambda: target_position_world(
+                        action_diagnostics.filtered_position,
+                        *(tensor.cpu().numpy() for tensor in robot.get_position_orientation()),
+                    ),
+                    eef_position_world=lambda: robot.eef_links[adapter.arm_name]
+                    .get_position_orientation()[0]
+                    .cpu()
+                    .numpy(),
+                    gate_decision=action_diagnostics.gate_decision,
+                    step_seconds=(step_return_monotonic_ns - action_apply_monotonic_ns) / 1e9,
+                    rate_limit_scale=action_diagnostics.tick_scale,
+                )
+                if sample is not None:
+                    print(sample.format(task.activity))
             grasp_trace_step = None
             if grasp_trace_collector is not None:
                 grasp_trace_step = grasp_trace_collector.capture_before_supervisor(
@@ -2683,12 +2778,19 @@ def main(argv: list[str] | None = None) -> None:
         or not math.isfinite(args.tracking_yaw_deg)
         or not math.isfinite(args.position_sensitivity)
         or args.position_sensitivity <= 0
+        or not math.isfinite(args.telemetry_interval)
+        or args.telemetry_interval < 0
+        or (
+            args.engage_after is not None
+            and (not math.isfinite(args.engage_after) or args.engage_after < 0)
+        )
         or not math.isfinite(args.assisted_grasp_squeeze_bias_rad)
         or args.assisted_grasp_squeeze_bias_rad < 0
     ):
         raise SystemExit(
-            "Step limits, source/frame timeouts, MANUS timeouts, tracking skew/yaw, position sensitivity, or assisted-grasp "
-            "squeeze bias are invalid (single-task --steps and squeeze bias may be 0)"
+            "Step limits, source/frame timeouts, MANUS timeouts, tracking skew/yaw, position sensitivity, "
+            "telemetry interval, or assisted-grasp squeeze bias are invalid (single-task --steps, the telemetry "
+            "interval, and the squeeze bias may be 0)"
         )
 
     tasks = catalog.resolve(args.task, args.subscale)
@@ -2708,6 +2810,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(
             "--recording-path is only supported during teleoperation, not with --view-only"
         )
+    if args.engage_after is not None and args.view_only:
+        raise SystemExit("--engage-after needs a tracking source; drop --view-only")
     if args.record_hand_poses and args.view_only:
         raise SystemExit(
             "--record-hand-poses is only supported during teleoperation, not with --view-only"

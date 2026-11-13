@@ -128,9 +128,9 @@ the Dashboard stored for the user.
 ## 3. VIVE Hub for Linux
 
 1. Download `VIVEHub-Linux-<version>-x86_64.tar.gz` (or `-arm64`) from the
-   latest release of `ViveRoboticsSoftware/VIVEHub-Linux` (1.0.1 or newer; it
-   also ships the VUT C++ SDK under `sdk/`, which `dex_teleop` does **not**
-   need: the sidecar speaks the socket protocol in Python).
+   latest release of `ViveRoboticsSoftware/VIVEHub-Linux` (1.0.3 at the time
+   of writing; it also ships the VUT C++ SDK under `sdk/`, which `dex_teleop`
+   does **not** need: the sidecar speaks the socket protocol in Python).
 2. `tar xzf VIVEHub-Linux-*.tar.gz && cd VIVEHub-Linux && sudo ./install-udev.sh`
    then re-plug the Ultimate dongle (`sudo ./install-box64.sh` on arm64).
 3. `./run-vivehub.sh` (always through the script). In the UI: pair each
@@ -139,13 +139,16 @@ the Dashboard stored for the user.
    non-reflective walls; include low angles), then confirm every tracker
    shows as *tracking*. Rebuild the map whenever the room changes.
 4. Keep VIVE Hub running: its `tracker_server` publishes poses on
-   `/tmp/vut.sock`. Check from Python without any other software:
+   `/tmp/vut.sock`. Check from Python without any other software (wake the
+   tracker first: an Ultimate that has been lying still goes to standby and
+   streams nothing until it is moved or its button is pressed):
 
 ```bash
 cd dex_teleop && python - <<'EOF'
 import time
 from dex_teleop.tracking.vive_ultimate import VutPoseFeed
 feed = VutPoseFeed("/tmp/vut.sock"); feed.start(); time.sleep(2.0)
+print("protocol:", feed.protocol, "updates:", feed.update_count)
 for slot, pose in feed.snapshot().items():
     print(slot, pose.tracker_id, pose.state_name, pose.quality, pose.position.round(3), f"{pose.battery}%")
 feed.close()
@@ -154,8 +157,25 @@ EOF
 
 The printed `tracker_id` is the serial that goes into
 `manus_expected_tracker_id` (fallback `vive_tracker_<slot>` when VIVE Hub
-reports no serial). Face the robot's `+X` when you build the map so the
+reports no serial; `configs/manus_core.yaml` carries this rig's
+`FA5AG3B00121`). Face the robot's `+X` when you build the map so the
 built-in Core-world calibration needs no `tracking_yaw_deg`.
+
+Two wire protocols have shipped on `/tmp/vut.sock`, and
+`dex_teleop.tracking.vive_ultimate` detects which one is running from the
+socket type (`protocol` above): VIVE Hub 1.0.3 and newer speak the **VUT SDK
+protocol** (`SOCK_SEQPACKET`, the format of HTC's `libvut_sdk`: a `HELLO`
+handshake, `LIST_DEVICES`, then `EVT_POSE`/`EVT_STATUS` datagrams with the
+serial in every pose and no battery level, so `battery` prints `-1`), VIVE
+Hub 1.0.1 and HTC's standalone SDK demo server speak the older **slot
+protocol** (`SOCK_STREAM`, `Add`/`Update` packets). Both decode into the same
+`VutTrackerPose`: `ready` + `trackable` is the only state the wrist role
+accepts; `ready` + `bad` is rotation-only tracking; `lost_tracking`,
+`syncing`, `build_map` (setup required), `preparing`, `loading`,
+`not_connected` and `off` are `untrackable`. VIVE Hub 1.0.3 forwards the
+tracker's raw status byte as the device state, so the pose-stable/charging
+flag bits ride along in `pose.flags`; the module masks them off before
+mapping the state.
 
 Frame convention: VIVE Hub reports OpenXR axes (x right, y up, -z forward),
 which are also MANUS Core's world axes, so `vive_ultimate_frame:
@@ -207,7 +227,7 @@ dex-teleop-manus-diagnostics \
   --mode integrated --hand right --duration 15 \
   --sdk-root ~/manus_setup/vendor/ManusSDK_v3.2.1 \
   --tracker-feed vive_ultimate --vive-ultimate-socket /tmp/vut.sock \
-  --expected-tracker-id 59-A33R03250 \
+  --expected-tracker-id FA5AG3B00121 \
   --require-tracker-motion --require-trackable-tracker \
   --tracker-stale-timeout 1.0 \
   --output outputs/manus-linux-acceptance.jsonl
@@ -229,14 +249,123 @@ role, owner, `vive_hub_linux` system, valid pose, advancing timestamp or
   wrist stops (the launcher raises after `manus_tracker_stale_timeout`);
 - Ctrl+C leaves no `manus_python_bridge` or glove vibration behind.
 
+### Wrist bench: hand + wrist in the simulator, no ARAT task
+
+`launch_wrist_bench.py` is the hand bench's complement for exactly these
+checks: the arm that carries the right Sharpa hand stays visible over the
+plain hand-bench table and runs the ARAT `InverseKinematicsController`, so the
+glove drives the fingers and the Ultimate drives the wrist through the same
+MANUS sidecar, `SharpaActionAdapter`, anchoring and workspace clamps as
+`launch_og.py`, but with no task, scoring or recording. It reads the same
+launch presets (`configs/manus_core.yaml` by default, so the tracker serial,
+SDK root and feed come from there; `--config hts` for the Quest):
+
+```bash
+# gloves on, Ultimate tracking in VIVE Hub, MANUS Dashboard closed
+python dex_teleop/scripts/launch_wrist_bench.py --position-sensitivity 1
+
+# the same rig on the Tianji Marvin M6 CCS arm instead of the Franka
+python dex_teleop/scripts/launch_wrist_bench.py --arm tianji --position-sensitivity 1
+```
+
+The arm is a YAML choice: `wrist_bench.arms` in
+`dex_teleop/src/dex_teleop/hand_bench/hand_bench.yaml` describes each arm
+(OmniGibson model and placement, palm link, named reset configurations for
+`--reset-pose`, the adapter's reach sphere and height band, the camera rig),
+`wrist_bench.arm` names the default (`franka`) and `--arm` overrides it.
+`franka` is the ARAT robot on its pedestal with the `compact`/`extended` ARAT
+reset poses; `tianji` is the Marvin Pro torso with its right Marvin M6 CCS arm
+and the hand on the arm's official end flange (`extended`: palm down in front
+of the right shoulder, `home`: Tianji's home pose), a robot asset generated by
+`dex_teleop/scripts/build_tianji_sharpa_right.py` and documented in
+`docs/tianji-m6-sharpa-mount.md`. Everything else (presets, keys, telemetry,
+the checks below) is identical for both arms; only the reach differs (the M6
+covers the rear half of the table from its 0.66 m sphere, the Franka the whole
+table from 0.80 m).
+
+Before Isaac Sim starts, the bench listens on `/tmp/vut.sock` for three
+seconds and refuses to continue unless the expected Ultimate is streaming
+`trackable` poses, naming the fix otherwise: no daemon (start VIVE Hub), the
+tracker listed as `ready` but silent (it is in standby or off: press its button
+or move it, and relaunch VIVE Hub if its window was closed; the `tracker_server`
+daemon outlives the window and keeps reporting the last state), `build_map`
+(run *Setup*), rotation-only/`syncing` (uncover the cameras, rebuild the map),
+or a different serial (fix `manus_expected_tracker_id`). The MANUS sidecar
+alone would report the same conditions only as "tracker packet not received"
+after its 35 s start-up timeout.
+
+Press SPACE to engage: the tracker pose at that moment is anchored onto the
+hand's current pose (palm down over the table centre). Then, with the arm
+markers on (default; T/E toggle the magenta commanded-target and cyan measured
+EEF frames, B cycles the overview/side/front cameras):
+
+0. check the axes first: up/down must be right, and forward/back and
+   left/right must not be swapped or reversed. Up/down right but both
+   horizontal directions reversed means the map's forward points opposite to
+   the robot's +X (a 180-degree `tracking_yaw_deg`); forward coming out
+   sideways means +/-90. The map's forward is simply where the tracker pointed
+   when *Start setup* was pressed, so measure it instead of guessing: with the
+   hand engaged press **Y**, move the tracker straight toward the table by at
+   least 10 cm, press **Y** again. The bench prints the measured yaw, applies
+   it on the spot (re-anchoring on the next frame) and tells you the value to
+   pin with `--tracking-yaw-deg` or `tracking_yaw_deg:` in
+   `configs/manus_core.yaml`, which `launch_og.py` reads too. Pitch and roll
+   of the hand come out reversed under the same error and are fixed by the same
+   number; only yaw and up/down are immune to it;
+1. translate the tracker 10 cm along each axis: the hand translates 10 cm the
+   same way (`--position-sensitivity 1`, i.e. 1:1; the ARAT preset's 1.5 scales
+   it); the side camera shows forward and vertical motion as pure translation;
+2. rotate the hand about the wrist without moving it: the telemetry line's
+   `wrist moved` stays within the mount-offset error (a few cm). A systematic
+   drift means `manus_tracker_to_wrist_*` does not match the mount; adjust it
+   in the YAML until rotating in place keeps the wrist still;
+3. cover the tracker's cameras: `quality` drops to `bad`/`untrackable`,
+   `health` turns `unhealthy (...)`, and after `manus_tracker_stale_timeout`
+   the bench stops with the tracker-stale error (`--stale-frame-policy hold`
+   holds the arm instead).
+
+One telemetry line prints per `--telemetry-interval` (1 s; 0 disables) while
+engaged, in the bench and, prefixed with the activity, in `launch_og.py`:
+
+```text
+[wrist bench t=   4.0s] FA5AG3B00121 quality=trackable health=healthy | wrist moved  12.3 cm, rotated  18.4 deg since anchor | target-EEF error   6.1 mm | frame age   11 ms | loop 29.8 Hz, env.step  21/ 28 ms
+[arat_grasp_block_10cm t=   2.1s] FA5AG3B00121 quality=trackable health=healthy | wrist moved   9.1 cm, rotated   0.0 deg since anchor | target-EEF error   0.3 mm | frame age  105 ms | loop 11.0 Hz, env.step  90/105 ms, rate limits x3.2
+```
+
+Reading it: `loop` is the number of applied actions per second and
+`env.step` the mean/max simulator step time behind it; a loop far below
+30 Hz is rendering/recording/task load, not tracking. `frame age` is how old
+the hand frame was when applied (tracking latency plus one step). A growing
+`target-EEF error` is the arm not keeping up with the command. `rate limits
+xN` means the per-tick motion caps (2 cm and the `SafetyConfig` velocities
+per 1/30 s) were scaled by the measured interval between actions, so a slow
+loop keeps the same top speed instead of a lower one (`SharpaAdapterConfig.
+wall_clock_rate_limits`, capped at 4 ticks so a stall never licenses a jump).
+The second line above is a real measurement: the ARAT launcher's step is
+about 4x the bench's because it renders five viewports plus the robot's RGB
+observations, records full simulator state to HDF5 every step, evaluates the
+BDDL goal and scorer, and runs GPU dynamics.
+
+SPACE again re-anchors, R returns the arm to `--reset-pose` (one of the
+selected arm's `reset_poses`), `--view-only`
+loads the scene without hardware, `--steps N` bounds a run, and
+`OMNIGIBSON_HEADLESS=1` runs it without a window (there is no keyboard then;
+`--engage-after 2` engages on its own two seconds after the bench is ready,
+so `OMNIGIBSON_HEADLESS=1 python dex_teleop/scripts/launch_wrist_bench.py
+--engage-after 2 --steps 600` is a complete scripted check whose telemetry
+lines land in the log).
+
 ## 6. Launch teleoperation
 
 ```bash
 conda run -n behavior_dex python dex_teleop/scripts/launch_og.py --task <activity>
 ```
 
-Press SPACE to engage and start recording. The spelled-out equivalent of the
-preset is:
+Press SPACE to engage and start recording (`--engage-after 2` does it
+unattended, e.g. headless). The preset moves the wrist 1:1
+(`position_sensitivity: 1.0`; the launcher's built-in default is 1.5) and
+prints the same telemetry line as the wrist bench once a second
+(`--telemetry-interval`). The spelled-out equivalent of the preset is:
 
 ```bash
 python dex_teleop/scripts/launch_og.py --no-config --task <activity> \
@@ -244,7 +373,7 @@ python dex_teleop/scripts/launch_og.py --no-config --task <activity> \
   --manus-backend python --manus-mode integrated \
   --manus-sdk-root ~/manus_setup/vendor/ManusSDK_v3.2.1 \
   --manus-tracker-feed vive_ultimate --vive-ultimate-socket /tmp/vut.sock \
-  --manus-expected-tracker-id 59-A33R03250 \
+  --manus-expected-tracker-id FA5AG3B00121 \
   --manus-tracker-stale-timeout 1.0 --record-hand-poses
 ```
 
@@ -294,12 +423,34 @@ contract is identical, so a future Isaac Teleop host can reuse
 - `expected tracker '...' is absent`: VIVE Hub is not running, the socket
   path differs (`vive_ultimate_socket`), or the serial is not the one VIVE
   Hub reports; list them with the Python snippet in section 3.
+- The snippet connects (`protocol: seqpacket`) but `updates: 0` and HTC's own
+  `sdk/examples/vut_demo` prints `no pose yet`: the Ultimate is in standby
+  (it stops streaming after lying still); move it or press its button. If
+  that does not help even though the VIVE Hub window says *tracking*, the
+  `tracker_server` daemon is stale: it outlives the window, keeps replaying
+  the last status it saw (watch the battery percentage never change), and a
+  relaunched window simply re-attaches to it (`[vivehub] connected to
+  tracker_server (... daemon_pid=<old pid>)` in
+  `~/.local/share/HTC/VIVEUltimateTracker/logs/`). Close the window,
+  `pkill -f tracker_server`, wake the tracker, and `./run-vivehub.sh` again;
+  the fresh daemon reconnects the paired tracker and its on-device map.
+- `Protocol wrong type for socket` from an older `dex_teleop` checkout: VIVE
+  Hub 1.0.3 switched `/tmp/vut.sock` to the SEQPACKET VUT SDK protocol;
+  current `vive_ultimate.py` detects both.
+- `MANUS bridge protocol stream closed` right after `Connected to VIVE
+  Ultimate tracker server`, with `python[...]: segfault ... in libc.so.6` in
+  `dmesg`, from an older checkout: `libManusSDK` crashes when a tracker pose
+  is injected before the Core session exists. The sidecar now holds VIVE
+  poses back until `sdk_connected` and never injects during an SDK restart.
 - `tracker quality is 'untrackable'`/`'bad'`: the Ultimate is `syncing`,
-  needs *Setup*, or lost tracking (rotation-only); check lighting, features,
-  lens cleanliness, and rebuild the map.
-- The hand moves along the wrong axes: toggle `vive_ultimate_frame`
-  (`x_right_y_up_z_back` for VIVE Hub, `x_forward_z_up` for HTC's SDK demo
-  server), then `tracking_yaw_deg` for a residual yaw.
+  `lost_tracking`, needs *Setup* (`build_map`), or is rotation-only (`bad`);
+  check lighting, features, lens cleanliness, and rebuild the map.
+- The hand moves along the wrong axes: if up/down is right and only the
+  horizontal directions are turned or reversed, it is `tracking_yaw_deg`
+  (180 for a straight reversal); measure it with the wrist bench's Y key or
+  rebuild the map facing the robot's +X. If up/down is wrong too, toggle
+  `vive_ultimate_frame` (`x_right_y_up_z_back` for VIVE Hub,
+  `x_forward_z_up` for HTC's SDK demo server) first, then the yaw.
 - Haptics never trigger: the glove must be a Metaglove Pro *Haptic*
   (`haptics: true` in the sidecar's `topology` event); lower
   `manus_haptics_min_force`.

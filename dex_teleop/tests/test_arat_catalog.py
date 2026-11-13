@@ -250,7 +250,7 @@ def test_camera_rig_declares_calibration_docking_and_toggle_cycles():
 
 
 def test_arat_default_camera_rig_is_default_and_selectable():
-    assert set(camera_rig_names()) == {"arat_sharpa_v1", "arat_default", "hand_bench"}
+    assert set(camera_rig_names()) == {"arat_sharpa_v1", "arat_default", "hand_bench", "wrist_bench", "wrist_bench_tianji"}
     camera_rig = load_camera_rig("arat_default")
 
     assert layout_camera_ids(camera_rig, "teleop") == (

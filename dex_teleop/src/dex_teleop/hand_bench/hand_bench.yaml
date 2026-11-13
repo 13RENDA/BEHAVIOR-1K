@@ -68,6 +68,86 @@ scene:
       position_tolerance_m: 0.01
       orientation_tolerance_deg: 2.0
 
+# Wrist bench (launch_wrist_bench.py): the same table, but the arm that carries
+# the right Sharpa hand is visible and follows the tracked wrist under the ARAT
+# InverseKinematicsController. `arm` selects which arm loads (--arm overrides
+# it); every arm below is a complete description of its robot: the OmniGibson
+# model and placement, the palm link, the named reset configurations of its 7
+# arm joints (--reset-pose; the open hand is appended), the SharpaActionAdapter
+# workspace clamps in the robot frame (robot z == world z, both arms stand on
+# the floor), and the camera rig with a 'teleop' layout that frames it.
+wrist_bench:
+  arm: franka
+  arms:
+    franka:
+      description: Franka Emika Panda on its 0.86 m pedestal (the ARAT robot) with the right Sharpa hand
+      robot:
+        model: franka
+        dataset_name: omnigibson-robot-assets
+        end_effector: sharpa_right
+        # The model OmniGibson embeds in the prim path (/controllable__<composed_model>__<name>):
+        # the end effector's model for robots with end-effector variants, else the model itself.
+        composed_model: franka_sharpa_right
+        name: wrist_bench_sharpa_right
+        arm_name: "0"               # controllers arm_0 / gripper_0
+        # The Franka root (its pedestal stands on the floor) half a metre behind the table
+        # centre, facing it along +X. With the "extended" pose the palm starts over the table
+        # centre, 0.48 m above the top, palm down, and the ARAT shoulder-reach sphere covers
+        # the table.
+        position: [-0.50, 0.0, 0.0]
+        orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+      palm_link: right_hand_C_MC
+      # The ARAT reset configurations (dex_teleop.arat.reset_poses; a test pins them):
+      # compact is the OmniGibson franka.yaml ready pose, extended the Deoxys golden pose.
+      reset_poses:
+        compact: [0.0, -1.3, 0.0, -2.87, 0.0, 2.0, 0.75]
+        extended: [0.09162008114028396, -0.19826458111314524, -0.01990020486871322,
+                   -2.4732269941140346, -0.01307073642274261, 2.30396583422025, 0.8480939705504309]
+      default_reset_pose: extended
+      # SharpaAdapterConfig defaults: reach sphere about the Panda shoulder, z band over the table.
+      workspace:
+        shoulder_position: [0.0, 0.0, 1.194]
+        shoulder_reach: 0.80
+        minimum_z: 0.82
+        maximum_z: 1.75
+      camera_rig: wrist_bench
+    tianji:
+      description: Tianji Marvin Pro torso, right Marvin M6 CCS arm, right Sharpa hand on the official end flange
+      robot:
+        # Built by dex_teleop/scripts/build_tianji_sharpa_right.py from the tianji_m6_ccs
+        # dual-arm model; the flange geometry and the mount are documented in
+        # dex_teleop/docs/tianji-m6-sharpa-mount.md (95 mm ISO 9409-1-50-4-M6 flange, pin-aligned).
+        model: tianji_m6_ccs_sharpa_right
+        dataset_name: omnigibson-robot-assets
+        end_effector: null
+        composed_model: tianji_m6_ccs_sharpa_right
+        name: wrist_bench_tianji_sharpa_right
+        arm_name: right             # controllers arm_right / gripper_right
+        # base_link is at the floor under the torso. The 0.75 m square base plate must clear
+        # the table's rear legs (x >= -0.225): at x = -0.63 its front edge is at -0.253. The
+        # torso is centred on the table like an operator standing at it, so the right
+        # shoulder (0.20 m to the right, 1.20 m up) is at world (-0.63, -0.20, 1.20); the
+        # M6's 0.70 m reach covers the rear half of the table.
+        position: [-0.63, 0.0, 0.0]
+        orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+      palm_link: right_hand_C_MC
+      # extended: palm down, fingers along +X, right_hand_C_MC at (0.50, -0.20, 1.10) in the
+      # base frame = world (-0.13, -0.20, 1.10): in front of the right shoulder, 0.35 m above
+      # the tabletop, fingertips over the table centre (Pinocchio IK, see the mount note).
+      # home: Tianji's upstream Marvin Pro home pose, hand forward at 0.945 m, palm inward.
+      reset_poses:
+        extended: [-1.233317, -1.338584, 1.411068, -1.857169, -1.387896, 0.215559, 0.585308]
+        home: [-1.7, -1.1, 1.1, -2.0, 0.37, 0.13, -0.55]
+      default_reset_pose: extended
+      # Reach sphere about the right shoulder: 696 mm J2-to-flange plus the 30 mm flange-to-
+      # palm offset, kept inside the stretched arm; same z band over the table as the Franka.
+      workspace:
+        shoulder_position: [0.0, -0.2005, 1.203]
+        shoulder_reach: 0.66
+        minimum_z: 0.82
+        maximum_z: 1.75
+      camera_rig: wrist_bench_tianji
+
 camera_rigs:
   hand_bench:
     sensor_defaults:
@@ -123,3 +203,122 @@ camera_rigs:
             dock: {parent: main, position: right, ratio: 0.35}
           decoder:
             dock: {parent: OYMotion EMG, position: bottom, ratio: 0.5}
+
+  # Wrist bench (launch_wrist_bench.py): the same table, but the Franka that
+  # carries the Sharpa hand is visible and follows the tracked wrist, so the
+  # cameras stand back far enough to frame the whole arm over the table.
+  wrist_bench:
+    sensor_defaults:
+      modalities: []
+      include_in_obs: false
+      calibration:
+        image_width: 1280
+        image_height: 960
+        horizontal_aperture: 20.955
+        focal_length: 17.0
+
+    cameras:
+      overview:
+        sensor_name: wrist_bench_overview_camera
+        prim_name: wrist_bench_overview_camera
+        parent: {frame: scene}
+        pose:
+          # Default view: behind the robot's right shoulder, looking down at
+          # the table centre [0, 0, 0.95] over the arm.
+          position: [-1.55, -1.25, 1.95]
+          orientation_xyzw: [0.4736132744, -0.2264882158, -0.3671877755, 0.7678324634]
+
+      side:
+        sensor_name: wrist_bench_side_camera
+        prim_name: wrist_bench_side_camera
+        parent: {frame: scene}
+        pose:
+          # From the robot's left (+Y), level with the hand: shows forward and
+          # vertical wrist motion as pure translation.
+          position: [0.15, 2.0, 1.55]
+          orientation_xyzw: [0.0223494198, 0.5968214559, 0.8015009698, 0.0300141382]
+
+      front:
+        sensor_name: wrist_bench_front_camera
+        prim_name: wrist_bench_front_camera
+        parent: {frame: scene}
+        pose:
+          # Facing the robot across the table (+X looking toward -X), the
+          # operator's own point of view mirrored.
+          position: [1.9, 0.0, 1.45]
+          orientation_xyzw: [0.4458522305, 0.4458522305, 0.5488312933, 0.5488312933]
+
+    layouts:
+      teleop:
+        workspace:
+          viewport_only: true
+          fill_viewports: false
+        viewports:
+          main:
+            main: true
+            camera: overview
+        toggles:
+          - key: B
+            viewport: main
+            cameras: [overview, side, front]
+
+  # Wrist bench with the Tianji arm (wrist_bench.arms.tianji): the Marvin Pro torso stands
+  # further back and is taller than the Franka pedestal, its welded left arm hangs on the
+  # +Y side, and the right hand hovers at about (-0.13, -0.20, 1.10), so the cameras aim at
+  # (-0.10, -0.10, 1.00) and the side view comes from the robot's right (-Y), where nothing
+  # stands between the camera and the hand.
+  wrist_bench_tianji:
+    sensor_defaults:
+      modalities: []
+      include_in_obs: false
+      calibration:
+        image_width: 1280
+        image_height: 960
+        horizontal_aperture: 20.955
+        focal_length: 17.0
+
+    cameras:
+      overview:
+        sensor_name: wrist_bench_overview_camera
+        prim_name: wrist_bench_overview_camera
+        parent: {frame: scene}
+        pose:
+          # Default view: behind the robot's right shoulder, a little above the hand, looking
+          # along the right arm at the hand and the table (kept below and right of the scene's
+          # low front light so its sphere stays out of frame).
+          position: [-1.10, -1.90, 1.90]
+          orientation_xyzw: [0.5299922496, -0.1373347866, -0.2099059750, 0.8100536115]
+
+      side:
+        sensor_name: wrist_bench_side_camera
+        prim_name: wrist_bench_side_camera
+        parent: {frame: scene}
+        pose:
+          # From the robot's right (-Y), level with the hand: forward and vertical wrist
+          # motion appear as pure translation.
+          position: [-0.10, -2.10, 1.55]
+          orientation_xyzw: [0.6061532467, 0.0, 0.0, 0.7953478745]
+
+      front:
+        sensor_name: wrist_bench_front_camera
+        prim_name: wrist_bench_front_camera
+        parent: {frame: scene}
+        pose:
+          # Facing the robot across the table (+X looking toward -X), from above the torso's
+          # head so the hand and the table top are both in view.
+          position: [1.90, 0.0, 2.10]
+          orientation_xyzw: [0.3509445376, 0.3689301713, 0.6235858699, 0.5931855722]
+
+    layouts:
+      teleop:
+        workspace:
+          viewport_only: true
+          fill_viewports: false
+        viewports:
+          main:
+            main: true
+            camera: overview
+        toggles:
+          - key: B
+            viewport: main
+            cameras: [overview, side, front]

@@ -446,3 +446,72 @@ def test_manus_sdk_metadata_names_the_python_bridge():
     assert metadata["backend"] == "python"
     assert metadata["bridge"]["file"] == "manus_python_bridge.py"
     assert len(metadata["bridge"]["sha256"]) == 64
+
+
+def test_attaching_the_recorder_waits_for_the_first_post_boundary_sample():
+    """SPACE attaches the collector and the loop checks stream freshness at once.
+
+    Attaching is a worker boundary that discards earlier receipts, so the
+    launcher must wait for the first sample fused after it (as it does after a
+    reset) or every role reads "has not produced a sample".
+    """
+
+    import threading
+    import time
+
+    from test_multi_source_worker import _FakeRetargeter, _FakeSource, _articulation, _wrist
+
+    from dex_teleop.omnigibson.launcher import _attach_recording_and_wait
+    from dex_teleop.runtime import MultiSourceTrackingWorker
+    from dex_teleop.tracking import SourceUnavailableError
+    from dex_teleop.types import Handedness
+
+    quest = _FakeSource("quest")
+    worker = MultiSourceTrackingWorker(
+        {"quest": quest},
+        articulation_source="quest",
+        wrist_source="quest",
+        retargeter=_FakeRetargeter(),
+        handedness=Handedness.RIGHT,
+    )
+    worker.start()
+    stop = threading.Event()
+
+    def stream():
+        frame_id = 0
+        while not stop.is_set():
+            frame_id += 1
+            now = time.monotonic()
+            quest.push_wrist(_wrist(now, source="hts", frame_id=frame_id))
+            quest.push_articulation(_articulation(now, source="hts", frame_id=frame_id))
+            time.sleep(0.01)
+
+    streamer = threading.Thread(target=stream, daemon=True)
+    streamer.start()
+    try:
+        worker.wait_for_first(1.0)
+        worker.check_stream_freshness(0.25)
+
+        # Without the wait, the very next freshness check after attaching fails.
+        probe = HandTrackingRecordingSession()
+        worker.set_recording_session(probe)
+        with pytest.raises(SourceUnavailableError, match="has not produced a sample"):
+            worker.check_stream_freshness(0.25)
+        worker.set_recording_session(None)
+        probe.close()
+
+        session = HandTrackingRecordingSession()
+        snapshot = _attach_recording_and_wait(worker, session, 1.0)
+        assert snapshot is not None and snapshot.articulation_row == 0
+        worker.check_stream_freshness(0.25)
+        worker.set_recording_session(None)
+        session.close()
+
+        stop.set()
+        streamer.join(timeout=1.0)
+        silent = HandTrackingRecordingSession()
+        with pytest.raises(SourceUnavailableError, match="did not resume after attaching the recorder"):
+            _attach_recording_and_wait(worker, silent, 0.05)
+    finally:
+        stop.set()
+        worker.close()

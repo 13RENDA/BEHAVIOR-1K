@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 import yaml
@@ -82,6 +82,102 @@ class HandBenchScene:
     table: HandBenchTable
     lights: tuple[dict, ...]
     robot: HandBenchRobot
+
+
+# ---------------------------------------------------------------------------
+# Wrist bench arms (hand_bench.yaml ``wrist_bench``)
+
+
+@dataclass(frozen=True)
+class WristBenchRobot:
+    """The OmniGibson robot that carries the hand on the wrist bench, and where it stands."""
+
+    model: str
+    dataset_name: str
+    end_effector: str | None
+    composed_model: str
+    name: str
+    arm_name: str
+    position: tuple[float, float, float]
+    orientation_xyzw: tuple[float, float, float, float]
+
+    @property
+    def prim_path(self) -> str:
+        return f"/controllable__{self.composed_model}__{self.name}"
+
+    @property
+    def arm_controller(self) -> str:
+        return f"arm_{self.arm_name}"
+
+    @property
+    def gripper_controller(self) -> str:
+        return f"gripper_{self.arm_name}"
+
+    def environment_config(self) -> dict:
+        """The ``robots`` entry fields that identify and place this robot."""
+
+        config = {
+            "model": self.model,
+            "dataset_name": self.dataset_name,
+            "name": self.name,
+            "position": list(self.position),
+            "orientation": list(self.orientation_xyzw),
+        }
+        if self.end_effector is not None:
+            config["end_effector"] = self.end_effector
+        return config
+
+
+@dataclass(frozen=True)
+class WristBenchWorkspace:
+    """``SharpaActionAdapter`` clamps for one arm, in the robot frame."""
+
+    shoulder_position: tuple[float, float, float]
+    shoulder_reach: float
+    minimum_z: float
+    maximum_z: float
+
+
+@dataclass(frozen=True)
+class WristBenchArm:
+    """One selectable arm of the wrist bench."""
+
+    key: str
+    description: str
+    robot: WristBenchRobot
+    palm_link: str
+    reset_poses: Mapping[str, tuple[float, ...]]
+    default_reset_pose: str
+    workspace: WristBenchWorkspace
+    camera_rig: str
+
+    def reset_joint_positions(self, reset_pose: str | None = None) -> list[float]:
+        """The named arm configuration followed by an open Sharpa hand."""
+
+        name = self.default_reset_pose if reset_pose is None else reset_pose
+        try:
+            arm = self.reset_poses[name]
+        except KeyError as error:
+            known = ", ".join(sorted(self.reset_poses))
+            raise ValueError(f"Arm {self.key!r} has no reset pose {name!r}; expected one of: {known}") from error
+        return list(arm) + [0.0] * len(SHARPA_ACTION_JOINTS)
+
+
+@dataclass(frozen=True)
+class WristBenchArms:
+    default_arm: str
+    arms: Mapping[str, WristBenchArm]
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.arms)
+
+    def arm(self, key: str | None = None) -> WristBenchArm:
+        name = self.default_arm if key is None else key
+        try:
+            return self.arms[name]
+        except KeyError as error:
+            raise ValueError(f"Unknown wrist bench arm {name!r}; expected one of: {', '.join(self.arms)}") from error
 
 
 def load_hand_bench_scene(path: str | Path = HAND_BENCH_PATH) -> HandBenchScene:
@@ -171,6 +267,96 @@ def load_hand_bench_scene(path: str | Path = HAND_BENCH_PATH) -> HandBenchScene:
     )
 
 
+def _identifier(value, description: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{description} must be a non-empty string")
+    return value
+
+
+def load_wrist_bench_arms(path: str | Path = HAND_BENCH_PATH) -> WristBenchArms:
+    """Load and validate the wrist bench's selectable arms (``wrist_bench`` in hand_bench.yaml)."""
+
+    with Path(path).open("r", encoding="utf-8") as stream:
+        raw = yaml.safe_load(stream)
+    if not isinstance(raw, dict) or raw.get("schema_version") != SUPPORTED_SCHEMA_VERSION:
+        raise ValueError(f"{path} must use schema_version {SUPPORTED_SCHEMA_VERSION}")
+    section = raw.get("wrist_bench")
+    if not isinstance(section, dict):
+        raise ValueError(f"{path} must define a wrist_bench mapping")
+    arms_raw = section.get("arms")
+    if not isinstance(arms_raw, dict) or not arms_raw:
+        raise ValueError("wrist_bench.arms must map at least one arm name to its definition")
+    default_arm = _identifier(section.get("arm"), "wrist_bench.arm")
+    if default_arm not in arms_raw:
+        raise ValueError(f"wrist_bench.arm {default_arm!r} is not one of the defined arms: {', '.join(arms_raw)}")
+
+    arms: dict[str, WristBenchArm] = {}
+    robot_names = set()
+    for key, arm_raw in arms_raw.items():
+        where = f"wrist_bench.arms.{key}"
+        if not isinstance(key, str) or not key or not isinstance(arm_raw, dict):
+            raise ValueError("Every wrist bench arm must be a named mapping")
+        robot_raw = arm_raw.get("robot")
+        if not isinstance(robot_raw, dict):
+            raise ValueError(f"{where}.robot must be a mapping")
+        end_effector = robot_raw.get("end_effector")
+        if end_effector is not None:
+            end_effector = _identifier(end_effector, f"{where}.robot.end_effector")
+        arm_name = robot_raw.get("arm_name")
+        if isinstance(arm_name, int) and not isinstance(arm_name, bool):
+            arm_name = str(arm_name)
+        robot = WristBenchRobot(
+            model=_identifier(robot_raw.get("model"), f"{where}.robot.model"),
+            dataset_name=_identifier(robot_raw.get("dataset_name"), f"{where}.robot.dataset_name"),
+            end_effector=end_effector,
+            composed_model=_identifier(robot_raw.get("composed_model"), f"{where}.robot.composed_model"),
+            name=_identifier(robot_raw.get("name"), f"{where}.robot.name"),
+            arm_name=_identifier(arm_name, f"{where}.robot.arm_name"),
+            position=_vector(robot_raw.get("position"), 3, f"{where}.robot.position"),
+            orientation_xyzw=_vector(robot_raw.get("orientation_xyzw"), 4, f"{where}.robot.orientation_xyzw"),
+        )
+        if robot.name in robot_names:
+            raise ValueError(f"{where}.robot.name {robot.name!r} is used by another arm")
+        robot_names.add(robot.name)
+
+        poses_raw = arm_raw.get("reset_poses")
+        if not isinstance(poses_raw, dict) or not poses_raw:
+            raise ValueError(f"{where}.reset_poses must map at least one pose name to 7 joint positions")
+        reset_poses = {
+            _identifier(name, f"{where}.reset_poses key"): _vector(values, FRANKA_ARM_DOFS, f"{where}.reset_poses.{name}")
+            for name, values in poses_raw.items()
+        }
+        default_reset_pose = _identifier(arm_raw.get("default_reset_pose"), f"{where}.default_reset_pose")
+        if default_reset_pose not in reset_poses:
+            raise ValueError(
+                f"{where}.default_reset_pose {default_reset_pose!r} is not one of: {', '.join(reset_poses)}"
+            )
+
+        workspace_raw = arm_raw.get("workspace")
+        if not isinstance(workspace_raw, dict):
+            raise ValueError(f"{where}.workspace must be a mapping")
+        workspace = WristBenchWorkspace(
+            shoulder_position=_vector(workspace_raw.get("shoulder_position"), 3, f"{where}.workspace.shoulder_position"),
+            shoulder_reach=_positive(workspace_raw.get("shoulder_reach"), f"{where}.workspace.shoulder_reach"),
+            minimum_z=_positive(workspace_raw.get("minimum_z"), f"{where}.workspace.minimum_z"),
+            maximum_z=_positive(workspace_raw.get("maximum_z"), f"{where}.workspace.maximum_z"),
+        )
+        if workspace.maximum_z <= workspace.minimum_z:
+            raise ValueError(f"{where}.workspace.maximum_z must exceed minimum_z")
+
+        arms[key] = WristBenchArm(
+            key=key,
+            description=_identifier(arm_raw.get("description", key), f"{where}.description"),
+            robot=robot,
+            palm_link=_identifier(arm_raw.get("palm_link"), f"{where}.palm_link"),
+            reset_poses=reset_poses,
+            default_reset_pose=default_reset_pose,
+            workspace=workspace,
+            camera_rig=_identifier(arm_raw.get("camera_rig"), f"{where}.camera_rig"),
+        )
+    return WristBenchArms(default_arm=default_arm, arms=arms)
+
+
 def reset_joint_positions(scene: HandBenchScene) -> list[float]:
     """The held Franka configuration followed by an open Sharpa hand."""
 
@@ -200,39 +386,85 @@ def hand_pose_error(
     return translation, math.degrees(2.0 * math.acos(dot))
 
 
-def robot_usd_path() -> Path:
-    """Resolve the USD that franka.yaml declares for the sharpa_right end effector."""
-
-    definition_path = _DATASETS_ROOT / ROBOT_DATASET_NAME / "models" / ROBOT_MODEL / f"{ROBOT_MODEL}.yaml"
+def _load_robot_definition(dataset_name: str, model: str) -> tuple[Path, dict]:
+    definition_path = _DATASETS_ROOT / dataset_name / "models" / model / f"{model}.yaml"
     try:
         with definition_path.open("r", encoding="utf-8") as stream:
             definition = yaml.safe_load(stream)
     except FileNotFoundError as error:
         raise FileNotFoundError(f"Missing robot definition: {definition_path}") from error
-    try:
-        usd_path = definition["manipulation"]["end_effectors"][ROBOT_END_EFFECTOR]["usd_path"]
-    except (KeyError, TypeError) as error:
-        raise ValueError(f"{definition_path} does not declare the {ROBOT_END_EFFECTOR} end effector") from error
-    return _DATASETS_ROOT / ROBOT_DATASET_NAME / usd_path
+    if not isinstance(definition, dict):
+        raise ValueError(f"{definition_path} is not a robot definition mapping")
+    return definition_path, definition
+
+
+def robot_usd_path(
+    model: str = ROBOT_MODEL,
+    dataset_name: str = ROBOT_DATASET_NAME,
+    end_effector: str | None = ROBOT_END_EFFECTOR,
+    *,
+    composed_model: str | None = None,
+) -> Path:
+    """Resolve the USD an OmniGibson robot definition declares (by default the hand bench's Franka + Sharpa).
+
+    With an ``end_effector`` the USD comes from that end effector's entry, as OmniGibson resolves
+    it; otherwise from the model's top-level ``usd_path`` (or OmniGibson's standard location).
+    ``composed_model`` is checked against the model OmniGibson embeds in the robot's prim path.
+    """
+
+    definition_path, definition = _load_robot_definition(dataset_name, model)
+    if end_effector is not None:
+        try:
+            entry = definition["manipulation"]["end_effectors"][end_effector]
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"{definition_path} does not declare the {end_effector} end effector") from error
+        usd_path = entry.get("usd_path")
+        prim_model = entry.get("model", model)
+        if usd_path is None:
+            raise ValueError(f"{definition_path}: end effector {end_effector} declares no usd_path")
+    else:
+        if (definition.get("manipulation") or {}).get("supported_end_effector"):
+            raise ValueError(f"{definition_path} has end-effector variants; select one with end_effector")
+        usd_path = definition.get("usd_path") or f"models/{model}/usd/{model}.usda"
+        prim_model = model
+    if composed_model is not None and composed_model != prim_model:
+        raise ValueError(
+            f"{definition_path}: OmniGibson names this robot's prim after {prim_model!r}, "
+            f"but the bench configuration says composed_model: {composed_model!r}"
+        )
+    return _DATASETS_ROOT / dataset_name / usd_path
+
+
+def _table_usd_path(table: HandBenchTable) -> Path:
+    return _DATASETS_ROOT / table.dataset_name / "objects" / table.category / table.model / "usd" / f"{table.model}.usd"
 
 
 def validate_runtime_assets(scene: HandBenchScene) -> None:
     """Fail early when the table or the Franka + Sharpa asset is unavailable."""
 
-    table = scene.table
-    required = [
-        _DATASETS_ROOT
-        / table.dataset_name
-        / "objects"
-        / table.category
-        / table.model
-        / "usd"
-        / f"{table.model}.usd",
-        robot_usd_path(),
-    ]
+    required = [_table_usd_path(scene.table), robot_usd_path()]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing required hand bench assets:\n" + "\n".join(missing))
+
+
+def validate_wrist_bench_assets(scene: HandBenchScene, arm: WristBenchArm) -> None:
+    """Fail early when the table or the selected arm's robot asset is unavailable."""
+
+    robot = arm.robot
+    required = [
+        _table_usd_path(scene.table),
+        robot_usd_path(robot.model, robot.dataset_name, robot.end_effector, composed_model=robot.composed_model),
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        hint = ""
+        if arm.key == "tianji":
+            hint = (
+                "\nBuild the Tianji + Sharpa robot with dex_teleop/scripts/build_tianji_sharpa_right.py "
+                "(see dex_teleop/docs/tianji-m6-sharpa-mount.md)"
+            )
+        raise FileNotFoundError(f"Missing required wrist bench assets for arm {arm.key!r}:\n" + "\n".join(missing) + hint)
 
 
 def build_hand_bench_config(

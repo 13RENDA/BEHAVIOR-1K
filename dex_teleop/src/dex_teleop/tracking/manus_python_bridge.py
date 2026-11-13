@@ -339,6 +339,14 @@ class Bridge:
         self._output_lock = threading.Lock()
         self._state = threading.Condition()
         self._stop = threading.Event()
+        # Tracker injection runs on the VIVE feed thread. libManusSDK segfaults
+        # when CoreSdk_SendDataForTrackers is called before the Core session
+        # exists (between InitializeIntegrated and the on-connect callback) or
+        # while the SDK is being shut down, so the feed thread only calls into
+        # the SDK while _sdk_ready is set, serialized against restarts by
+        # _sdk_lock (never acquire _state before _sdk_lock).
+        self._sdk_ready = False
+        self._sdk_lock = threading.Lock()
         self._wrapper = None
         self._callbacks_registered = False
         self._sdk_initialized = False
@@ -449,6 +457,10 @@ class Bridge:
             and self._connect_callback_generation == self._connection_generation
         )
 
+    def _set_sdk_ready(self, ready: bool) -> None:
+        with self._state:
+            self._sdk_ready = ready
+
     def _qualification_complete(self) -> bool:
         return (
             self._versions_qualified
@@ -477,6 +489,7 @@ class Bridge:
                 return 14
             if not self.configure_hand_motion():
                 return 15
+            self._set_sdk_ready(True)
             self.emit_status("sdk_connected", f"MANUS {self.options.mode} host connected", **self.connection_fields())
             self.start_command_channel()
             qualification_deadline = time.monotonic() + self.options.glove_timeout
@@ -925,21 +938,24 @@ class Bridge:
                 return False
             selected = dict(self._selected_host)
             self._restarting_sdk = True
+            self._sdk_ready = False
             self.reset_qualification_locked()
         self.emit_status(
             "reconnecting",
             f"Restarting the MANUS SDK before reconnecting to locked Core host {selected.get('name', '')} ({selected.get('ip', '')})",
         )
         deadline = time.monotonic() + self.options.reconnect_timeout
-        self.unregister_callbacks()
-        shutdown_result = self.lib.CoreSdk_ShutDown()
-        self._sdk_initialized = False
-        if shutdown_result != self.success:
-            self.fail("sdk_restart_failed", "CoreSdk_ShutDown failed while preparing Remote reconnect", shutdown_result, 17)
-            return False
-        if not self.initialize_sdk():
-            self.fail("sdk_restart_failed", "MANUS SDK reinitialization failed during Remote reconnect", exit_code=17)
-            return False
+        with self._sdk_lock:
+            # No feed-thread SDK call may overlap the shutdown/re-initialization.
+            self.unregister_callbacks()
+            shutdown_result = self.lib.CoreSdk_ShutDown()
+            self._sdk_initialized = False
+            if shutdown_result != self.success:
+                self.fail("sdk_restart_failed", "CoreSdk_ShutDown failed while preparing Remote reconnect", shutdown_result, 17)
+                return False
+            if not self.initialize_sdk():
+                self.fail("sdk_restart_failed", "MANUS SDK reinitialization failed during Remote reconnect", exit_code=17)
+                return False
         with self._state:
             self._restarting_sdk = False
             self._selected_host = selected
@@ -956,11 +972,10 @@ class Bridge:
         if not connected:
             self.fail("reconnect_failed", "Restarted MANUS SDK did not reconnect to the locked Core host before the bounded deadline", connect_result, 17)
             return False
-        return (
-            self.check_versions(deadline)
-            and self.configure_hand_motion()
-            and self.wait_for_stream_qualification(deadline, reconnecting=True)
-        )
+        if not (self.check_versions(deadline) and self.configure_hand_motion()):
+            return False
+        self._set_sdk_ready(True)
+        return self.wait_for_stream_qualification(deadline, reconnecting=True)
 
     # -- SDK callbacks ---------------------------------------------------------
 
@@ -994,6 +1009,7 @@ class Bridge:
                 previous_session = self._session_id
                 self._connection_generation = previous_generation + 1
                 self._recovering = True
+                self._sdk_ready = False
                 self._streaming_enabled = False
                 self._required_frame_seen = False
                 self._required_topology_qualified = False
@@ -1416,6 +1432,16 @@ class Bridge:
         self._emit_vut_trackers(pose, user_id)
 
     def _inject_tracker(self, pose: VutTrackerPose, core_pose: RigidTransform, user_id: int | None) -> None:
+        with self._sdk_lock:
+            with self._state:
+                ready = self._sdk_ready and not self._stopping
+            if not ready:
+                # No Core session yet (or the SDK is restarting): the pose is kept in
+                # _vut_latest for wrist composition and injected once connected.
+                return
+            self._inject_tracker_locked(pose, core_pose, user_id)
+
+    def _inject_tracker_locked(self, pose: VutTrackerPose, core_pose: RigidTransform, user_id: int | None) -> None:
         lib, ffi, enums = self.lib, self.ffi, self.enums
         data = ffi.new("TrackerData*")
         _set_char_array(ffi, data.trackerId.id, pose.tracker_id)
@@ -1613,6 +1639,7 @@ class Bridge:
     def shutdown(self) -> None:
         with self._state:
             self._stopping = True
+            self._sdk_ready = False
             self._streaming_enabled = False
         if self._vut_feed is not None:
             self._vut_feed.close()
@@ -1622,19 +1649,20 @@ class Bridge:
                 self.stop_haptics()
             except Exception:  # noqa: BLE001
                 pass
-        self.unregister_callbacks()
-        if self._connected:
-            try:
-                self.lib.CoreSdk_Disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            self._connected = False
-        if self._sdk_initialized:
-            try:
-                self.lib.CoreSdk_ShutDown()
-            except Exception:  # noqa: BLE001
-                pass
-            self._sdk_initialized = False
+        with self._sdk_lock:
+            self.unregister_callbacks()
+            if self._connected:
+                try:
+                    self.lib.CoreSdk_Disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._connected = False
+            if self._sdk_initialized:
+                try:
+                    self.lib.CoreSdk_ShutDown()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._sdk_initialized = False
 
     def request_stop(self) -> None:
         self._stop.set()

@@ -236,6 +236,10 @@ def test_safety_filter_rate_limits_instead_of_changing_dimensions():
     safety.reset(np.zeros(2))
 
     assert np.allclose(safety.apply(np.ones(2)), [0.1, 0.2])
+    # A loop that took three ticks since the last command may move three ticks' worth.
+    assert np.allclose(safety.apply(np.ones(2), tick_scale=3.0), [0.4, 0.8])
+    with pytest.raises(ValueError, match="tick_scale"):
+        safety.apply(np.ones(2), tick_scale=0.0)
 
 
 class _Source(HandTrackingSource):

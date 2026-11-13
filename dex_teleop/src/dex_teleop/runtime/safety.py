@@ -53,7 +53,19 @@ class SafetyFilter:
     def reset(self, command: np.ndarray) -> None:
         self._previous = self._validate(command)
 
-    def apply(self, command: np.ndarray, logger: logging.Logger | None = None) -> np.ndarray:
+    def apply(
+        self, command: np.ndarray, logger: logging.Logger | None = None, *, tick_scale: float = 1.0
+    ) -> np.ndarray:
+        """Smooth and rate-limit ``command``.
+
+        The caps are sized for one nominal tick (``dt``). ``tick_scale`` is the
+        measured wall-clock interval since the previous command in nominal
+        ticks; passing it keeps the velocity caps a speed rather than a
+        per-call distance when the control loop runs slower than ``1/dt``.
+        """
+
+        if not np.isfinite(tick_scale) or tick_scale <= 0.0:
+            raise ValueError("tick_scale must be positive and finite")
         target = self._validate(command)
         if not self.config.enabled or self._previous is None:
             self._previous = target
@@ -61,8 +73,8 @@ class SafetyFilter:
         alpha = self.config.smoothing_alpha
         target = alpha * target + (1.0 - alpha) * self._previous
         raw_delta = target - self._previous
-        delta = np.clip(raw_delta, -self._velocity_cap, self._velocity_cap)
-        delta = np.clip(delta, -self._delta_cap, self._delta_cap)
+        delta = np.clip(raw_delta, -self._velocity_cap * tick_scale, self._velocity_cap * tick_scale)
+        delta = np.clip(delta, -self._delta_cap * tick_scale, self._delta_cap * tick_scale)
         if (
             logger is not None
             and self.config.log_clips

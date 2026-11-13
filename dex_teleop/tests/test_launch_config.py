@@ -65,14 +65,15 @@ def test_default_preset_is_the_linux_manus_core_path():
     # The Core-world calibration falls back to the built-in default; the rig's
     # tracker serial is filled in and the glove owner is resolved at runtime.
     assert args.manus_core_calibration is None
-    assert args.manus_expected_tracker_id == "59-A33R03250"
+    assert args.manus_expected_tracker_id == "FA5AG3B00121"
     assert args.manus_expected_tracker_user_id is None
     _validate_manus_selection(args, selection)
 
 
 def test_default_preset_without_a_tracker_serial_names_the_missing_key(tmp_path):
     document = (LAUNCH_CONFIG_ROOT / "manus_core.yaml").read_text(encoding="utf-8")
-    document = document.replace('manus_expected_tracker_id: "59-A33R03250"', "manus_expected_tracker_id: null")
+    document = document.replace('manus_expected_tracker_id: "FA5AG3B00121"', "manus_expected_tracker_id: null")
+    assert "manus_expected_tracker_id: null" in document
     preset = _write(tmp_path, document)
 
     args, _ = _parse("--config", str(preset), "--task", TASK)

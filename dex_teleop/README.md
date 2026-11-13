@@ -73,6 +73,14 @@ datasets/arat-assets-v1/                                                        
 datasets/arat-task-instances/                                                   <- 19 ARAT task scene instances (ARAT launcher only)
 ```
 
+The wrist bench's second arm, the Tianji Marvin M6 CCS carrying the same
+Sharpa hand (`datasets/omnigibson-robot-assets/models/tianji_m6_ccs_sharpa_right/`),
+is not in the zips: it is generated from the `tianji_m6_ccs` dual-arm model
+in the robot assets by `dex_teleop/scripts/build_tianji_sharpa_right.py`
+followed by the OmniGibson URDF importer; the steps and the official Tianji
+flange data behind the mount are in `dex_teleop/docs/tianji-m6-sharpa-mount.md`.
+Only `--arm tianji` needs it.
+
 ## 4. Smoke test without hardware
 
 ```bash
@@ -270,8 +278,56 @@ pytest -q dex_teleop/tests
 - `Synchroni SDK is unavailable in this Python environment`: install the SDK
   as in step 7 (or pass `--emg-sdk-path`); the sidecar imports it from the
   same conda environment as the bench.
+- The hand moves the right way up/down but reversed or turned horizontally:
+  `tracking_yaw_deg` is wrong for the current VIVE Hub map; measure it with
+  the wrist bench's Y key (see "More").
+- `Protocol wrong type for socket` on `/tmp/vut.sock`, or a `libManusSDK`
+  segfault right after connecting to the tracker server: an older checkout;
+  current `vive_ultimate.py` and the sidecar handle both (runbook
+  troubleshooting).
 
 ## More
+
+Hand **and** wrist without an ARAT task: `dex_teleop/scripts/launch_wrist_bench.py`
+keeps the arm that carries the hand visible over the same table under the
+ARAT IK controller, so the glove drives the fingers and the VIVE Tracker
+Ultimate (through VIVE Hub for Linux and the MANUS sidecar) drives the wrist;
+it reads the same presets as `launch_og.py` and prints tracker quality and
+wrist motion telemetry. The arm is configured in `hand_bench.yaml`
+(`wrist_bench.arms`: the ARAT Franka, the default, or the Tianji Marvin M6
+CCS; `--arm tianji` selects the latter). It is also installed as
+`dex-teleop-wrist-bench`. Before Isaac Sim starts it checks for three seconds
+that the expected Ultimate streams `trackable` poses on `/tmp/vut.sock`; once
+engaged, the **Y** key measures the residual `tracking_yaw_deg` (press, move
+the tracker 10 cm toward the table, press again). See "Wrist bench" in
+`dex_teleop/docs/manus-linux-vive-ultimate-runbook.md`.
+
+Shared by the wrist bench and `launch_og.py`:
+
+- `--telemetry-interval S` (default 1 s, 0 disables) prints one line per
+  interval while engaged: tracker serial, quality and health, wrist motion and
+  rotation since the anchor, target-EEF error, frame age, loop rate and
+  `env.step` time, and the rate-limit scale.
+- `--engage-after S` engages S seconds after the scene is ready (as SPACE
+  would), the only way to engage in an `OMNIGIBSON_HEADLESS=1` run.
+- The wrist step cap and `SafetyConfig` velocity caps are sized per 1/30 s
+  tick and are now scaled by the measured wall-clock interval between actions
+  (at most 4 ticks; `SharpaAdapterConfig.wall_clock_rate_limits`), so a slow
+  simulator loop lowers the update rate but not the hand's top speed.
+- `dex_teleop.tracking.vive_ultimate` reads both VIVE Hub socket protocols
+  and picks one from the socket type: the SEQPACKET VUT SDK protocol of VIVE
+  Hub 1.0.3 and newer, and the older stream "slot" protocol of VIVE Hub 1.0.1
+  and HTC's SDK demo server.
+- The Python MANUS sidecar injects VIVE poses into Core only once the Core
+  session is connected and never during an SDK restart (earlier injection
+  segfaulted `libManusSDK`), and the launcher waits for the first fresh
+  sample after attaching the recorder before checking stream freshness.
+
+`configs/manus_core.yaml` carries this rig's values: tracker serial
+`FA5AG3B00121`, `position_sensitivity: 1.0` (1:1, metric tracker; the
+built-in default is 1.5), and `tracking_yaw_deg: 180.0` (this VIVE Hub map
+faces away from the robot's +X). Re-measure the yaw with the wrist bench
+whenever the map is rebuilt.
 
 The ARAT task launcher (`dex_teleop/scripts/launch_og.py`) reads its options
 from a YAML preset in `dex_teleop/configs/` (`manus_core.yaml`, the default:

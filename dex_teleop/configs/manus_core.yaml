@@ -50,9 +50,10 @@ manus_tracker_to_casing_translation: null      # same offset, sent to Core as Ri
 manus_tracker_to_casing_rotation_xyzw: null
 
 # Required for the MANUS wrist role: the Ultimate's serial as VIVE Hub lists
-# it (also the "Add" name on the tracker socket). The launcher refuses to
-# start while it is null, so fill it in once for this rig.
-manus_expected_tracker_id: "59-A33R03250"   # VIVE Ultimate Tracker 1, mounted on the right glove
+# it (the Device.name / Pose.serial on the tracker socket; print it with the
+# VutPoseFeed snippet in docs/manus-linux-vive-ultimate-runbook.md). The
+# launcher refuses to start while it is null, so fill it in once for this rig.
+manus_expected_tracker_id: "FA5AG3B00121"   # VIVE Ultimate Tracker 1 (dongle slot 2), mounted on the right glove
 # With the Linux feed the tracker is assigned to the Core user that owns the
 # right glove automatically; set an explicit user id only to pin it.
 manus_expected_tracker_user_id: null
@@ -97,8 +98,14 @@ maximum_source_skew: 0.05           # unused for MANUS/MANUS: both components sh
 maximum_frame_age: 0.25
 stale_frame_policy: error           # or hold
 initial_frame_timeout: 10.0
-position_sensitivity: 1.5
-tracking_yaw_deg: 0.0               # residual yaw between the VIVE Hub map's forward and the robot's +X
+# 1:1 wrist translation (the launcher's built-in default is 1.5); the Ultimate
+# is a metric tracker, so 1.0 makes the hand move exactly as far as yours.
+position_sensitivity: 1.0
+# Residual yaw between the VIVE Hub map's forward and the robot's +X. This
+# rig's map was built facing away from the robot's +X, so the horizontal axes
+# came out reversed; 180 corrects it. Re-measure with the wrist bench's Y key
+# (launch_wrist_bench.py) whenever the map is rebuilt.
+tracking_yaw_deg: 180.0
 
 # --- Recording -------------------------------------------------------------
 # SPACE engages teleoperation and starts recording; R ends the episode and

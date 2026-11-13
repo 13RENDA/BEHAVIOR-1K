@@ -104,6 +104,60 @@ def test_position_sensitivity_must_be_finite_and_positive(position_sensitivity):
         make_adapter(SharpaAdapterConfig(control_hz=30.0, position_sensitivity=position_sensitivity))
 
 
+def _step_with_loop_period(monkeypatch, adapter, period_s, wrist_position):
+    """Run one action with the wall clock advanced by ``period_s`` since the previous one."""
+
+    import dex_teleop.omnigibson.sharpa_adapter as module
+
+    clock = {"now": adapter._last_action_monotonic or 0.0}
+    clock["now"] += period_s
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+    return adapter.action(snapshot(wrist_position=wrist_position, timestamp=clock["now"]))
+
+
+def test_position_step_cap_follows_the_wall_clock_so_slow_loops_keep_the_top_speed(monkeypatch):
+    import dex_teleop.omnigibson.sharpa_adapter as module
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0.0)
+    adapter = make_adapter(SharpaAdapterConfig(control_hz=30.0))  # 0.02 m per 1/30 s tick = 0.6 m/s
+    anchored = adapter.action(snapshot(wrist_position=[0.0, 0.0, 0.0], timestamp=0.0))
+    far = [0.5, 0.0, 0.0]
+
+    # Loop keeping up (one tick): the nominal 2 cm step.
+    first = _step_with_loop_period(monkeypatch, adapter, 1.0 / 30.0, far)
+    assert first[0] - anchored[0] == pytest.approx(0.02, abs=1e-4)
+    assert adapter.last_wrist_diagnostics.tick_scale == pytest.approx(1.0)
+    # A 100 ms step (three ticks): three times the distance, i.e. the same 0.6 m/s.
+    second = _step_with_loop_period(monkeypatch, adapter, 0.1, far)
+    assert second[0] - first[0] == pytest.approx(0.06, abs=1e-4)
+    assert adapter.last_wrist_diagnostics.tick_scale == pytest.approx(3.0)
+    # A long stall is capped at rate_limit_scale_cap ticks, never one huge jump.
+    third = _step_with_loop_period(monkeypatch, adapter, 2.0, far)
+    assert third[0] - second[0] == pytest.approx(0.08, abs=1e-4)
+    assert adapter.last_wrist_diagnostics.tick_scale == pytest.approx(4.0)
+    # Faster than nominal never tightens the cap below one tick.
+    fourth = _step_with_loop_period(monkeypatch, adapter, 0.005, far)
+    assert fourth[0] - third[0] == pytest.approx(0.02, abs=1e-4)
+    assert adapter.last_wrist_diagnostics.tick_scale == pytest.approx(1.0)
+    # Re-anchoring forgets the previous action time: the next action is one tick again.
+    adapter.request_anchor()
+    _step_with_loop_period(monkeypatch, adapter, 5.0, far)
+    assert adapter.last_wrist_diagnostics.tick_scale == pytest.approx(1.0)
+
+
+def test_wall_clock_rate_limits_can_be_disabled(monkeypatch):
+    import dex_teleop.omnigibson.sharpa_adapter as module
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0.0)
+    adapter = make_adapter(SharpaAdapterConfig(control_hz=30.0, wall_clock_rate_limits=False))
+    anchored = adapter.action(snapshot(wrist_position=[0.0, 0.0, 0.0], timestamp=0.0))
+    slow = _step_with_loop_period(monkeypatch, adapter, 0.1, [0.5, 0.0, 0.0])
+    assert slow[0] - anchored[0] == pytest.approx(0.02, abs=1e-4)
+    assert adapter.last_wrist_diagnostics.tick_scale == 1.0
+    with pytest.raises(ValueError, match="rate_limit_scale_cap"):
+        make_adapter(SharpaAdapterConfig(control_hz=30.0, rate_limit_scale_cap=0.5))
+
+
 def test_action_passes_live_fingers_through_without_freeze():
     adapter = make_adapter()
     fingers = finger_slice(adapter.action(snapshot()))

@@ -25,16 +25,31 @@ from dex_teleop.tracking.manus_python_bridge import (
     parse_options,
 )
 from dex_teleop.tracking.transforms import RigidTransform, compose_transforms, inverse_transform
-from dex_teleop.tracking.vive_ultimate import STATE_SYNCING, VUT_TRACKING_SYSTEM
+from dex_teleop.tracking.vive_ultimate import DEV_SYNCING, STATE_SYNCING, VUT_TRACKING_SYSTEM
 from dex_teleop.types import Handedness
 
-from fake_vut_server import FakeVutServer
+from fake_vut_server import FakeVutSdkServer, FakeVutServer
 
 TESTS = Path(__file__).resolve().parent
 FAKE_SDK = TESTS / "fake_manus_sdk"
 SERIAL = "59-A33R03250"
 GLOVE_ID = 1417281806
 GLOVE_USER_ID = 7
+
+
+def _start_vut_server(daemon: str, socket_path: str, **kwargs):
+    """A fake VIVE Hub daemon: ``stream`` (1.0.1 slot protocol) or ``seqpacket`` (1.0.3 VUT SDK)."""
+
+    if daemon == "stream":
+        return FakeVutServer(socket_path, rate_hz=120.0, **kwargs).start()
+    return FakeVutSdkServer(socket_path, rate_hz=120.0, **kwargs).start()
+
+
+def _lose_tracking(daemon: str, server) -> None:
+    server.state = STATE_SYNCING if daemon == "stream" else DEV_SYNCING
+
+
+VUT_DAEMONS = ("stream", "seqpacket")
 
 
 def _wait(predicate, timeout=5.0, interval=0.01):
@@ -208,9 +223,10 @@ def test_integrated_python_bridge_reports_a_missing_license(fake_sdk, monkeypatc
     source.close()
 
 
-def test_vive_ultimate_feed_drives_a_tracker_gated_wrist(fake_sdk, tmp_path):
+@pytest.mark.parametrize("daemon", VUT_DAEMONS)
+def test_vive_ultimate_feed_drives_a_tracker_gated_wrist(fake_sdk, tmp_path, daemon):
     socket_path = str(tmp_path / "vut.sock")
-    server = FakeVutServer(socket_path, serial=SERIAL, rate_hz=120.0).start()
+    server = _start_vut_server(daemon, socket_path, serial=SERIAL)
     calibration = ManusCoreCalibration.default()
     source = _source(
         tracker_feed="vive_ultimate",
@@ -279,9 +295,10 @@ def test_vive_ultimate_feed_drives_a_tracker_gated_wrist(fake_sdk, tmp_path):
     assert motions == [2]  # HandMotion.Tracker
 
 
-def test_vive_ultimate_tracking_loss_fails_wrist_control(fake_sdk, tmp_path):
+@pytest.mark.parametrize("daemon", VUT_DAEMONS)
+def test_vive_ultimate_tracking_loss_fails_wrist_control(fake_sdk, tmp_path, daemon):
     socket_path = str(tmp_path / "vut.sock")
-    server = FakeVutServer(socket_path, serial=SERIAL, rate_hz=120.0).start()
+    server = _start_vut_server(daemon, socket_path, serial=SERIAL)
     source = _source(
         tracker_feed="vive_ultimate",
         vive_ultimate_socket=socket_path,
@@ -293,7 +310,7 @@ def test_vive_ultimate_tracking_loss_fails_wrist_control(fake_sdk, tmp_path):
     try:
         with source:
             assert _wait(lambda: bool(source.drain_hand_tracking(Handedness.RIGHT).wrists))
-            server.state = STATE_SYNCING
+            _lose_tracking(daemon, server)
 
             def _unhealthy():
                 try:

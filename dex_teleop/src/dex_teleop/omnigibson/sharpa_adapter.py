@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 import logging
 import math
+import time
 from typing import Mapping
 
 import numpy as np
@@ -70,6 +71,14 @@ class SharpaAdapterConfig:
     maximum_z: float = 1.75
     maximum_position_step: float = 0.02
     finger_target_scale: float = 1.0
+    # The per-action limits above and in SafetyConfig are sized for one control
+    # tick (1 / control_hz). With wall-clock rate limits the measured interval
+    # since the previous action scales them (never below one tick, at most
+    # rate_limit_scale_cap ticks), so a simulator step slower than the nominal
+    # tick lowers the update rate but not the hand's top speed. Capping the
+    # scale keeps a long stall from licensing one large jump.
+    wall_clock_rate_limits: bool = True
+    rate_limit_scale_cap: float = 4.0
     # Wrist-orientation glitch gate: a tracked-wrist rotation larger than this between
     # consecutive frames (45 degrees; hand trackers flip ~180 degrees on closed-fist /
     # edge-on poses) is impossible for a human and is rejected -- the last accepted
@@ -110,6 +119,9 @@ class WristActionDiagnostics:
     gate_decision: str
     gate_reason: str | None
     hemisphere_corrected: bool
+    # Wall-clock interval since the previous action in nominal control ticks, as
+    # applied to the rate limits (1.0 when the loop keeps up or the feature is off).
+    tick_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -136,6 +148,8 @@ class SharpaActionAdapter:
             raise ValueError("position_sensitivity must be finite and positive")
         if not 0.0 < config.finger_target_scale <= 1.0:
             raise ValueError("finger_target_scale must be in (0, 1]")
+        if not math.isfinite(config.rate_limit_scale_cap) or config.rate_limit_scale_cap < 1.0:
+            raise ValueError("rate_limit_scale_cap must be finite and at least 1")
         self.robot = robot
         self.config = config
         self.arm_name = robot.arm_names[0]
@@ -167,6 +181,7 @@ class SharpaActionAdapter:
         self._accepted_wrist_history: deque[tuple[float, np.ndarray]] = deque()
         self._rejection_started: float | None = None
         self._last_wrist_diagnostics: WristActionDiagnostics | None = None
+        self._last_action_monotonic: float | None = None
         self.request_anchor()
 
     def request_anchor(self) -> None:
@@ -178,6 +193,7 @@ class SharpaActionAdapter:
         self._accepted_wrist_history = deque()
         self._rejection_started = None
         self._last_wrist_diagnostics = None
+        self._last_action_monotonic = None
         base_position, base_quaternion = self.robot.get_position_orientation()
         eef_position, eef_quaternion = self.robot.eef_links[self.arm_name].get_position_orientation()
         relative_position, relative_quaternion = T.relative_pose_transform(
@@ -209,6 +225,7 @@ class SharpaActionAdapter:
             extra = set(positions_by_name).difference(SHARPA_ACTION_JOINTS)
             raise ValueError(f"Sharpa command joint mismatch; missing={sorted(missing)}, extra={sorted(extra)}")
 
+        tick_scale = self._tick_scale()
         base_position, base_quaternion = self.robot.get_position_orientation()
         eef_position, eef_quaternion = self.robot.eef_links[self.arm_name].get_position_orientation()
         eef_relative_position, eef_relative_quaternion = T.relative_pose_transform(
@@ -225,7 +242,7 @@ class SharpaActionAdapter:
         wrist_position_robot = mapped_position_world - base_position_np
         if self._position_offset is None:
             self._position_offset = eef_relative_position.cpu().numpy() - wrist_position_robot
-        target_position = self._clamp_position(wrist_position_robot + self._position_offset)
+        target_position = self._clamp_position(wrist_position_robot + self._position_offset, tick_scale)
 
         gate = self._gate_wrist_orientation(frame.wrist_quaternion_xyzw, frame.timestamp)
         wrist_quaternion_xyzw = gate.quaternion_xyzw
@@ -261,7 +278,7 @@ class SharpaActionAdapter:
                 hand_positions,
             ]
         )
-        filtered = self.safety.apply(target, logger=LOGGER)
+        filtered = self.safety.apply(target, logger=LOGGER, tick_scale=tick_scale)
         self._last_wrist_diagnostics = WristActionDiagnostics(
             frame_timestamp=frame.timestamp,
             input_quaternion_xyzw=np.asarray(frame.wrist_quaternion_xyzw, dtype=np.float64).copy(),
@@ -276,8 +293,20 @@ class SharpaActionAdapter:
             gate_decision=gate.decision,
             gate_reason=gate.reason,
             hemisphere_corrected=gate.hemisphere_corrected,
+            tick_scale=tick_scale,
         )
         return th.as_tensor(filtered, dtype=th.float32)
+
+    def _tick_scale(self) -> float:
+        """Wall-clock interval since the previous action in nominal ticks, clamped to [1, cap]."""
+
+        now = time.monotonic()
+        previous = self._last_action_monotonic
+        self._last_action_monotonic = now
+        if not self.config.wall_clock_rate_limits or previous is None:
+            return 1.0
+        ticks = (now - previous) * self.config.control_hz
+        return float(min(max(ticks, 1.0), self.config.rate_limit_scale_cap))
 
     def _gate_wrist_orientation(self, quaternion_xyzw: np.ndarray, timestamp: float) -> _WristGateResult:
         """Reject impossibly fast tracked-wrist rotations and hold the last good orientation.
@@ -387,6 +416,7 @@ class SharpaActionAdapter:
             gate_decision=diagnostics.gate_decision,
             gate_reason=diagnostics.gate_reason,
             hemisphere_corrected=diagnostics.hemisphere_corrected,
+            tick_scale=diagnostics.tick_scale,
         )
 
     @property
@@ -395,7 +425,7 @@ class SharpaActionAdapter:
         positions = self.robot.get_joint_positions()[list(self.finger_dof_indices)]
         return dict(zip(SHARPA_ACTION_JOINTS, positions.tolist()))
 
-    def _clamp_position(self, position: np.ndarray) -> np.ndarray:
+    def _clamp_position(self, position: np.ndarray, tick_scale: float = 1.0) -> np.ndarray:
         target = np.asarray(position, dtype=np.float64).copy()
         target[2] = np.clip(target[2], self.config.minimum_z, self.config.maximum_z)
         shoulder = np.asarray(self.config.shoulder_position, dtype=np.float64)
@@ -404,9 +434,10 @@ class SharpaActionAdapter:
         if distance > self.config.shoulder_reach:
             target = shoulder + displacement * (self.config.shoulder_reach / distance)
         if self._previous_target_position is not None:
+            maximum_step = self.config.maximum_position_step * tick_scale
             step = target - self._previous_target_position
             step_size = np.linalg.norm(step)
-            if step_size > self.config.maximum_position_step:
-                target = self._previous_target_position + step * (self.config.maximum_position_step / step_size)
+            if step_size > maximum_step:
+                target = self._previous_target_position + step * (maximum_step / step_size)
         self._previous_target_position = target.copy()
         return target

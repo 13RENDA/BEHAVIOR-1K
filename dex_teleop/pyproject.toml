@@ -29,6 +29,7 @@ dex-teleop-manus-diagnostics = "dex_teleop.tracking.manus_diagnostics:main"
 dex-teleop-manus-bridge = "dex_teleop.tracking.manus_python_bridge:main"
 dex-teleop-og = "dex_teleop.omnigibson.launcher:main"
 dex-teleop-hand-bench = "dex_teleop.hand_bench.launcher:main"
+dex-teleop-wrist-bench = "dex_teleop.hand_bench.wrist_bench:main"
 dex-teleop-replay = "dex_teleop.omnigibson.replay:main"
 
 [tool.setuptools]
