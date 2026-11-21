@@ -53,4 +53,4 @@ dex_teleop = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "../bddl3"]  # the repository's own BDDL, as the launch scripts load it

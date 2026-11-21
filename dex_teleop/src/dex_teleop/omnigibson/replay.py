@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from dex_teleop.arat import AratTaskCatalog
+from dex_teleop.arat.arms import load_arat_arms, recorded_stance, recording_arm
 from dex_teleop.arat.camera_rig import apply_camera_lens_models, build_camera_sensor_configs, load_camera_rig
 from dex_teleop.arat.scene import validate_runtime_assets
 from dex_teleop.omnigibson.evaluation_trace import read_evaluation_episode
@@ -111,14 +112,19 @@ def replay_camera_ids(camera_rig_name: str = DEFAULT_CAMERA_RIG_NAME) -> tuple[s
     return tuple(dict.fromkeys((main_camera_id, *REPLAY_CORNER_CAMERA_IDS)))
 
 
-def build_replay_camera_configs(camera_rig_name: str = DEFAULT_CAMERA_RIG_NAME) -> list[dict]:
-    """Enable RGB observations on the cameras used in the replay mosaic."""
+def build_replay_camera_configs(
+    camera_rig_name: str = DEFAULT_CAMERA_RIG_NAME, robot_prim_path: str = ROBOT_PRIM_PATH
+) -> list[dict]:
+    """Enable RGB observations on the cameras used in the replay mosaic.
+
+    ``robot_prim_path`` is the recorded arm's prim (the wrist cameras hang on its palm link).
+    """
 
     camera_rig = load_camera_rig(camera_rig_name)
     cameras = build_camera_sensor_configs(
         camera_rig,
         "teleop",
-        robot_prim_path=ROBOT_PRIM_PATH,
+        robot_prim_path=robot_prim_path,
         camera_ids=replay_camera_ids(camera_rig_name),
         viewport_name=None,
     )
@@ -648,8 +654,13 @@ def replay_hdf5_to_video(
     task_name: str | None = None,
     n_render_iterations: int = 1,
     evaluation_overlay: bool = False,
+    expected_arm: str | None = None,
 ) -> Path:
-    """Replay one recorded episode from serialized state and render it to MP4."""
+    """Replay one recorded episode from serialized state and render it to MP4.
+
+    The arm is the one the recording was made with (its saved robot config and arm provenance);
+    ``expected_arm`` only asserts it, and a mismatch is refused.
+    """
 
     input_path = Path(input_path).expanduser().resolve()
     info = inspect_recording(input_path)
@@ -675,7 +686,25 @@ def replay_hdf5_to_video(
         task = catalog.tasks[task_name]
     except KeyError as error:
         raise ValueError(f"Recording contains an unknown ARAT task: {task_name}") from error
-    validate_runtime_assets((task,))
+    arm, provenance = recording_arm(input_path, load_arat_arms())
+    if expected_arm is not None and expected_arm != arm.key:
+        raise ValueError(
+            f"This recording was made with arm {arm.key!r} ({arm.bench.robot.model}); it cannot be replayed "
+            f"as {expected_arm!r}. Drop --arm or pass --arm {arm.key}."
+        )
+    print(
+        f"Recorded arm: {arm.key} ({arm.description})"
+        + ("" if provenance is not None else "; no arm provenance in the file (recorded before --arm existed)")
+    )
+    # The stance the recording was made in (base pose, apparatus layout), not whatever arms.yaml
+    # assigns to the task today; a recording whose stance was redefined since is refused.
+    stance = recorded_stance(input_path, arm, task, provenance)
+    if stance is not None:
+        print(
+            f"Recorded stance: {stance.name}, base at {list(stance.base.position)} yaw {stance.base.yaw_deg:g} deg, "
+            + ("apparatus as saved" if stance.layout is None else f"apparatus layout {stance.layout.to_json()}")
+        )
+    validate_runtime_assets((task,), arm)
 
     from omnigibson.macros import gm
 
@@ -688,7 +717,9 @@ def replay_hdf5_to_video(
 
     camera_rig = load_camera_rig(task.camera_rig)
     camera_ids = replay_camera_ids(task.camera_rig)
-    replay_camera_configs = build_replay_camera_configs(task.camera_rig)
+    replay_camera_configs = build_replay_camera_configs(task.camera_rig, arm.prim_path)
+    # Same views as while recording: the scene cameras turn (and move) with the recorded stance.
+    arm.place_scene_cameras(task, replay_camera_configs, stance=stance)
     main_camera_id = camera_rig.layout("teleop")["viewports"]["main"]["camera"]
     main_calibration = camera_rig.calibration(main_camera_id)
     camera_keys = {
@@ -740,6 +771,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", help="Output MP4 path; defaults beside the recording")
     parser.add_argument("--episode-id", type=int, help="Episode to replay; omit to select interactively")
     parser.add_argument("--task", help="Optional expected task name used to validate the recording")
+    parser.add_argument(
+        "--arm",
+        choices=load_arat_arms().names,
+        help="Optional expected arm; the replay always uses the recorded arm and refuses a mismatch",
+    )
     parser.add_argument("--n-render-iterations", type=int, default=1)
     parser.add_argument(
         "--evaluation-overlay",
@@ -763,6 +799,19 @@ def main(argv: list[str] | None = None) -> None:
         args.episode_id = prompt_for_episode(info)
     if args.n_render_iterations <= 0:
         raise SystemExit("--n-render-iterations must be positive")
+    try:
+        recorded_arm, _provenance = recording_arm(args.input, load_arat_arms())
+        # Refuse a recording whose stance (base pose, apparatus layout) was redefined since, before Kit starts.
+        recorded_task = AratTaskCatalog().tasks.get(info.task_name)
+        if recorded_task is not None:
+            recorded_stance(args.input, recorded_arm, recorded_task, _provenance)
+    except ValueError as error:
+        raise SystemExit(f"Cannot replay: {error}") from error
+    if args.arm is not None and args.arm != recorded_arm.key:
+        raise SystemExit(
+            f"This recording was made with arm {recorded_arm.key!r} ({recorded_arm.bench.robot.model}); it cannot "
+            f"be replayed as {args.arm!r}. Drop --arm or pass --arm {recorded_arm.key}."
+        )
     if args.headless:
         os.environ["OMNIGIBSON_HEADLESS"] = "1"
 
@@ -774,6 +823,7 @@ def main(argv: list[str] | None = None) -> None:
             task_name=args.task,
             n_render_iterations=args.n_render_iterations,
             evaluation_overlay=args.evaluation_overlay,
+            expected_arm=args.arm,
         )
     finally:
         if "omnigibson" in sys.modules:

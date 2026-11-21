@@ -167,6 +167,14 @@ def _slerp_xyzw(first: np.ndarray, second: np.ndarray, fraction: float) -> np.nd
     )
 
 
+_CARRIED_TRACKER_KEYS = (
+    "validated_tracker_id",
+    "validated_tracker_quality",
+    "tracker_health",
+    "tracker_health_reason",
+)
+
+
 def _interpolate_wrist(
     before: WristPoseSample,
     after: WristPoseSample,
@@ -212,6 +220,14 @@ def _interpolate_wrist(
         anatomical_frame=before.anatomical_frame,
         confidence=min(confidences) if confidences else None,
         provenance={
+            # Tracker identity/quality/health shared by both ends (e.g. the glove-free VIVE wrist) stay
+            # visible to the telemetry line after interpolation.
+            **{
+                key: after.provenance[key]
+                for key in _CARRIED_TRACKER_KEYS
+                if before.provenance and after.provenance
+                and key in before.provenance and key in after.provenance
+            },
             "interpolated": True,
             "before_source_frame_id": before.source_frame_id,
             "after_source_frame_id": after.source_frame_id,

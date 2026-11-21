@@ -47,7 +47,12 @@ class EmgHdf5Writer:
         channel_count: int,
         metadata: dict,
         flush_interval_s: float = 1.0,
+        fit_sample_period: bool = False,
     ) -> None:
+        # fit_sample_period: measure the band's sample period against the host clock instead of trusting the
+        # nominal rate when the per-sample host times are estimated at close (see estimate_sample_times)
+        self.fit_sample_period = bool(fit_sample_period)
+        self._segment_first_rows: list[int] = [0]
         if sample_rate_hz <= 0 or channel_count <= 0:
             raise ValueError("EMG sample rate and channel count must be positive")
         self.output_path = Path(output_path)
@@ -136,6 +141,12 @@ class EmgHdf5Writer:
             ),
         }
 
+    def mark_segment(self) -> None:
+        """The next appended batch starts a new uninterrupted stretch (the band's sample counter restarted)."""
+
+        if self._sample_count not in self._segment_first_rows:
+            self._segment_first_rows.append(self._sample_count)
+
     def append(self, batch: EmgBatch) -> None:
         if batch.channel_count != self.channel_count:
             raise ValueError(
@@ -194,9 +205,23 @@ class EmgHdf5Writer:
             receive_times = np.asarray(self._group["batches/receive_monotonic_ns"], dtype=np.int64)
             last_rows = first_rows + batch_counts - 1
             last_indices = indices[last_rows]
-            candidate_origins = receive_times - (last_indices - first_index) * nominal_period_ns
-            origin_ns = int(candidate_origins.min())
-            estimated[:] = origin_ns + (indices - first_index) * nominal_period_ns
+            if self.fit_sample_period:
+                estimated[:], fit = estimate_sample_times(
+                    indices, last_rows, receive_times, nominal_period_ns,
+                    fit_period=True, segment_first_rows=tuple(self._segment_first_rows),
+                )
+                origin_ns = int(estimated[0])
+                self._group.attrs["estimated_timestamp_semantics"] = (
+                    "sample period fitted per uninterrupted stretch to the least-delayed callbacks, each stretch "
+                    "anchored to its callback with minimum observed receive delay"
+                )
+                self._group.attrs["fitted_sample_period_ns"] = np.asarray(fit["period_ns"], dtype=np.float64)
+                self._group.attrs["fitted_segment_first_row"] = np.asarray(fit["segment_first_rows"], dtype=np.int64)
+                self._group.attrs["fitted_segment_period_measured"] = np.asarray(fit["fitted"], dtype=np.bool_)
+            else:
+                candidate_origins = receive_times - (last_indices - first_index) * nominal_period_ns
+                origin_ns = int(candidate_origins.min())
+                estimated[:] = origin_ns + (indices - first_index) * nominal_period_ns
             residuals = receive_times - estimated[last_rows]
             self._group.attrs["first_sample_index"] = first_index
             self._group.attrs["estimated_first_sample_monotonic_ns"] = origin_ns
@@ -217,6 +242,82 @@ class EmgHdf5Writer:
 
     def __exit__(self, exc_type, exc_value, traceback_value):
         self.close()
+
+
+FIT_WINDOW_SECONDS = 5.0  # the earliest callback in each window of this length gives one point of the fit
+FIT_MINIMUM_WINDOWS = 4   # a shorter stretch keeps the nominal period (or the period of a longer stretch)
+
+
+def _fitted_period_ns(indices: np.ndarray, receive_times: np.ndarray, nominal_period_ns: int) -> float | None:
+    """Sample period of one uninterrupted stretch, from its least-delayed callbacks; None if it is too short."""
+
+    window = max(1, int(round(FIT_WINDOW_SECONDS * 1e9 / nominal_period_ns)))
+    bins = (indices - indices[0]) // window
+    slack = receive_times - (indices - indices[0]) * nominal_period_ns
+    fit_index, fit_time = [], []
+    for value in np.unique(bins):
+        rows = np.flatnonzero(bins == value)
+        best = rows[np.argmin(slack[rows])]
+        fit_index.append(indices[best] - indices[0])
+        fit_time.append(receive_times[best] - receive_times[0])
+    if len(fit_index) < FIT_MINIMUM_WINDOWS:
+        return None
+    slope, _intercept = np.polyfit(np.asarray(fit_index, dtype=np.float64), np.asarray(fit_time, dtype=np.float64), 1)
+    return float(slope)
+
+
+def estimate_sample_times(
+    indices: np.ndarray,
+    last_rows: np.ndarray,
+    receive_times: np.ndarray,
+    nominal_period_ns: int,
+    *,
+    fit_period: bool = False,
+    segment_first_rows: tuple[int, ...] = (0,),
+) -> tuple[np.ndarray, dict]:
+    """Host time of every sample from its index: ``origin + index * period``, anchored to the callback with the
+    minimum observed receive delay.
+
+    ``fit_period=False`` uses the nominal period for the whole recording. The band's clock is not the host's
+    (measured 2026-11-14: 501.35-501.43 samples per host second at a nominal 500), so that estimate drifts by
+    about 2.7 ms per second of recording. ``fit_period=True`` measures the period of each uninterrupted
+    stretch (``segment_first_rows``: the rows where the sample counter restarted) from its least-delayed
+    callbacks and anchors each stretch on its own.
+    """
+
+    indices = np.asarray(indices, dtype=np.int64)
+    last_rows = np.asarray(last_rows, dtype=np.int64)
+    receive_times = np.asarray(receive_times, dtype=np.int64)
+    estimated = np.empty(len(indices), dtype=np.int64)
+    starts = sorted({0, *(int(row) for row in segment_first_rows if 0 < int(row) < len(indices))}) if fit_period else [0]
+    bounds = list(zip(starts, starts[1:] + [len(indices)]))
+    periods: list[float | None] = []
+    for first, end in bounds:
+        batches = np.flatnonzero((last_rows >= first) & (last_rows < end))
+        periods.append(
+            _fitted_period_ns(indices[last_rows[batches]], receive_times[batches], nominal_period_ns)
+            if fit_period and len(batches)
+            else None
+        )
+    longest = max(
+        (item for item in zip(bounds, periods) if item[1] is not None), key=lambda item: item[0][1] - item[0][0], default=None
+    )
+    fallback = float(nominal_period_ns) if longest is None else float(longest[1])
+    used = [fallback if period is None else period for period in periods]
+    previous_end = None
+    for (first, end), period in zip(bounds, used):
+        relative = indices[first:end] - indices[first]
+        batches = np.flatnonzero((last_rows >= first) & (last_rows < end))
+        if len(batches):
+            offsets = np.round((indices[last_rows[batches]] - indices[first]) * period).astype(np.int64)
+            origin = int((receive_times[batches] - offsets).min())
+        else:  # a stretch without a complete callback cannot be anchored: continue from the previous one
+            origin = (previous_end or 0) + int(round(period))
+        if previous_end is not None and origin <= previous_end:
+            origin = previous_end + 1
+        estimated[first:end] = origin + np.round(relative * period).astype(np.int64)
+        previous_end = int(estimated[end - 1])
+    return estimated, {"period_ns": used, "segment_first_rows": starts, "fitted": [period is not None for period in periods]}
 
 
 class _UdpPublisher:
@@ -342,7 +443,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-ms", type=int, default=5000)
     parser.add_argument("--filter-hpf", choices=("on", "off"), default="on")
     parser.add_argument("--filter-lpf", choices=("on", "off"), default="on")
-    parser.add_argument("--filter-notch", choices=("off", "50", "60", "both"), default="60")
+    parser.add_argument("--filter-notch", choices=("off", "50", "60", "both"), default="both")
     parser.add_argument("--visualize-decoder", action="store_true")
     parser.add_argument("--emg2pose-root")
     parser.add_argument("--emg2pose-checkpoint")

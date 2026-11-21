@@ -33,6 +33,13 @@ from dex_teleop.arat.eval.report import (
     write_item_result,
     write_session_result,
 )
+from dex_teleop.arat.arms import (
+    AratArm,
+    arm_provenance,
+    load_arat_arms,
+    task_reach,
+    write_arm_provenance,
+)
 from dex_teleop.arat.reset_poses import (
     DEFAULT_RESET_POSE,
     add_reset_pose_argument,
@@ -81,6 +88,8 @@ from dex_teleop.tracking import (
     HTSSource,
     SourceUnavailableError,
 )
+from dex_teleop.tracking.dexemg import DexemgArticulationSource
+from dex_teleop.tracking.vive_wrist import ViveUltimateWristSource, default_tracker_to_wrist
 from dex_teleop.tracking.manus import (
     MANUS_BACKENDS,
     MANUS_TRACKER_FEEDS,
@@ -97,15 +106,26 @@ from dex_teleop.types import Handedness
 
 
 LOGGER = logging.getLogger(__name__)
+# How long the control loop waits for the tracking streams' bookkeeping to catch up after one of its own
+# iterations blocked for longer than --maximum-frame-age (see wait_for_fresh_streams).
+STREAM_CATCH_UP_SECONDS = 0.5
 # Presets describe teleoperation runs; these modes construct no tracking source
 # or recording, so the preset is not applied when either flag is present.
 PRESET_SKIP_FLAGS = ("--view-only", "--list-tasks")
 # Physical tracking providers; the registry key equals the CLI/YAML name.
 TRACKING_SOURCES = ("quest", "manus")
+# dexemg (fingers decoded from the wrist EMG band) is articulation-only; vive (the VIVE Tracker Ultimate
+# read directly from VIVE Hub, no glove) is wrist-only.
+ARTICULATION_SOURCES = (*TRACKING_SOURCES, "dexemg")
+WRIST_SOURCES = (*TRACKING_SOURCES, "vive_ultimate")
 DEFAULT_TRACKING_SOURCE = "quest"
 ROBOT_COMPOSED_MODEL = f"{ROBOT_MODEL}_{ROBOT_END_EFFECTOR}"
 ROBOT_PRIM_PATH = f"/controllable__{ROBOT_COMPOSED_MODEL}__{ROBOT_NAME}"
+# The arms that can run the ARAT tasks (--arm); the default is the Franka the task instances were
+# laid out for, whose robot, pose and reset poses are exactly the constants above.
+ARAT_ARMS = load_arat_arms()
 CAMERA_TOGGLE_DEBOUNCE_SECONDS = 0.25
+RESET_KEY_DEBOUNCE_SECONDS = 1.0
 DEFAULT_RECORDING_ROOT = Path(__file__).resolve().parents[3] / "outputs" / "recordings"
 
 
@@ -208,27 +228,31 @@ def add_tracking_arguments(parser: argparse.ArgumentParser) -> argparse.Argument
 
     parser.add_argument(
         "--hand-source",
-        choices=TRACKING_SOURCES,
-        help="Articulation provider used for control (quest is the Quest Hand Tracking Streamer)",
+        choices=ARTICULATION_SOURCES,
+        help=(
+            "Articulation provider used for control (quest is the Quest Hand Tracking Streamer; dexemg "
+            "is the wrist EMG band decoded by the dexemg bridge, dex_teleop/scripts/dexemg_bridge.py)"
+        ),
     )
     parser.add_argument(
         "--wrist-source",
-        choices=TRACKING_SOURCES,
+        choices=WRIST_SOURCES,
         help=(
             "Anatomical-wrist provider (manus: the VIVE Ultimate Tracker through the MANUS "
-            "sidecar, from VIVE Hub for Linux in Integrated mode or from Windows Core in Remote mode)"
+            "sidecar, from VIVE Hub for Linux in Integrated mode or from Windows Core in Remote mode; "
+            "vive_ultimate: the same tracker read directly from VIVE Hub for Linux, no glove)"
         ),
     )
     parser.add_argument(
         "--record-hand-source",
-        choices=TRACKING_SOURCES,
+        choices=ARTICULATION_SOURCES,
         action="append",
         default=[],
         help="Also acquire this articulation source at native rate; may be repeated",
     )
     parser.add_argument(
         "--record-wrist-source",
-        choices=TRACKING_SOURCES,
+        choices=WRIST_SOURCES,
         action="append",
         default=[],
         help="Also acquire this wrist source at native rate; may be repeated",
@@ -324,6 +348,42 @@ def add_tracking_arguments(parser: argparse.ArgumentParser) -> argparse.Argument
         ),
     )
     parser.add_argument(
+        "--vive-tracker-id",
+        help="Serial of the VIVE Ultimate on the wrist, as VIVE Hub lists it (--wrist-source vive_ultimate)",
+    )
+    parser.add_argument(
+        "--vive-tracker-to-wrist-translation",
+        type=_float_tuple(3),
+        default=None,
+        help="Tracker origin -> wrist joint offset in the tracker frame, m (default: the MANUS mount example)",
+    )
+    parser.add_argument(
+        "--vive-tracker-to-wrist-rotation-xyzw",
+        type=_float_tuple(4),
+        default=None,
+        help="Tracker -> wrist rotation, xyzw (default: identity)",
+    )
+    parser.add_argument(
+        "--vive-tracker-stale-timeout",
+        type=float,
+        default=1.0,
+        help="Fail wrist control when the tracker has no trackable pose for this long (s)",
+    )
+    parser.add_argument("--dexemg-host", default="127.0.0.1", help="dexemg bridge address (--hand-source dexemg)")
+    parser.add_argument("--dexemg-port", type=int, default=8765, help="dexemg bridge TCP port")
+    parser.add_argument(
+        "--dexemg-startup-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the bridge's first hand (it must have recorded its neutral)",
+    )
+    parser.add_argument(
+        "--dexemg-stale-timeout",
+        type=float,
+        default=1.0,
+        help="Fail finger control when the bridge sends no hand for this long (s)",
+    )
+    parser.add_argument(
         "--manus-wrist-composition",
         choices=MANUS_WRIST_COMPOSITIONS,
         default="bridge",
@@ -369,6 +429,19 @@ def add_tracking_arguments(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument("--manus-haptics-min-amplitude", type=float, default=0.15, help="Amplitude floor while touching")
     parser.add_argument("--manus-haptics-smoothing", type=float, default=0.5, help="Decay smoothing factor per update (1 = none)")
     parser.add_argument("--manus-haptics-rate", type=float, default=30.0, help="Maximum haptic command rate in Hz")
+    parser.add_argument(
+        "--manus-haptics-grasp-hold",
+        type=float,
+        default=0.35,
+        help="Amplitude on the grasping digits while the assisted grasp holds an object (0 = no grasp cue; default 0.35)",
+    )
+    parser.add_argument(
+        "--manus-haptics-grasp-pulse",
+        type=float,
+        default=0.15,
+        metavar="S",
+        help="Length of the full-amplitude pulse on the grasping digits when the assisted grasp welds (default 0.15 s)",
+    )
     parser.add_argument(
         "--manus-core-host",
         help="Remote Core selector: exact discovered IP, exact name, or sorted zero-based index",
@@ -461,6 +534,16 @@ def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
         help="Record synchronized native-rate OYMotion EMG and show it in a docked Kit window",
     )
     parser.add_argument(
+        "--emg-bridge",
+        action="store_true",
+        help=(
+            "Record the EMG through the running dexemg bridge instead of connecting to the band (implies --emg). "
+            "The bridge keeps the band, so this works while teleoperating with the glove (the bridge only "
+            "supplies the samples) and with --hand-source dexemg (it decodes and supplies the samples). "
+            "Bridge address: --dexemg-host / --dexemg-port"
+        ),
+    )
+    parser.add_argument(
         "--emg-device",
         help="OYMotion device name substring or Bluetooth address (auto-selects when exactly one is found)",
     )
@@ -489,7 +572,7 @@ def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
         "--emg-notch",
         choices=("off", "50", "60", "both"),
         default=None,
-        help="Explicit firmware mains-notch selection (default: 60)",
+        help="Explicit firmware mains-notch selection (default: both, i.e. every firmware filter on, as HandSync records)",
     )
     parser.add_argument("--emg-scan-ms", type=int, default=5000)
     parser.add_argument("--emg-connect-timeout", type=float, default=45.0)
@@ -530,7 +613,32 @@ def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
         action="store_true",
         help="Load the selected saved scene without a robot or hand-tracking source",
     )
-    add_reset_pose_argument(parser)
+    add_reset_pose_argument(
+        parser,
+        sorted(
+            {
+                name
+                for key in ARAT_ARMS.names
+                for stance in (ARAT_ARMS.arm(key).stances or {}).values()
+                for name in stance.reset_poses
+            }
+        ),
+    )
+    parser.add_argument(
+        "--arm",
+        choices=ARAT_ARMS.names,
+        default=ARAT_ARMS.default_arm,
+        help=(
+            "Arm carrying the right Sharpa hand: franka (default, the arm the task instances were laid out "
+            "for) or tianji (Marvin M6 CCS; stands at its own base pose and start configuration from "
+            "arat/arms.yaml, see docs/tianji-arat.md)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-unreachable",
+        action="store_true",
+        help="Load a task even when the selected arm cannot reach all of its targets from its base pose",
+    )
     parser.add_argument(
         "--assisted-grasp",
         action="store_true",
@@ -558,6 +666,119 @@ def _parser(catalog: AratTaskCatalog) -> argparse.ArgumentParser:
         default=30.0,
         metavar="NM|none",
         help="PhysX weld break torque in newton-metres; use 'none' to disable (default: 30)",
+    )
+    parser.add_argument(
+        "--assisted-grasp-weld",
+        choices=("rigid", "compliant"),
+        default="rigid",
+        help=(
+            "How a held object is attached to the palm: rigid (fixed joint with the break limits above, "
+            "default) or compliant (6-DOF spring that saturates at the break force/torque instead of "
+            "snapping, hand-object collisions filtered while held; carries small objects and lets a tube "
+            "slide off its peg)"
+        ),
+    )
+    parser.add_argument(
+        "--assisted-grasp-weld-stiffness",
+        type=float,
+        default=3000.0,
+        metavar="N/M",
+        help="Linear stiffness of the compliant weld (default: 3000)",
+    )
+    parser.add_argument(
+        "--assisted-grasp-weld-angular-stiffness",
+        type=float,
+        default=20.0,
+        metavar="NM/RAD",
+        help="Angular stiffness of the compliant weld (default: 20)",
+    )
+    parser.add_argument(
+        "--object-depenetration-velocity",
+        type=float,
+        default=OBJECT_MAX_DEPENETRATION_VELOCITY,
+        metavar="M/S",
+        help=(
+            "With --assisted-grasp: cap on how fast PhysX pushes an object out of a penetrating hand or table "
+            f"(default: {OBJECT_MAX_DEPENETRATION_VELOCITY:g}). 0.3 keeps a thin object (sharpening stone) from being "
+            "flung away when a finger presses on it"
+        ),
+    )
+    parser.add_argument(
+        "--assisted-grasp-window",
+        type=float,
+        default=0.3,
+        metavar="S",
+        help=(
+            "How long the weld rule must hold without interruption before the object is welded (default: 0.3 s). "
+            "A 6 mm ball bearing stays pinched for 0.1 to 0.23 s at a time: use 0.1 for the ball-bearing tasks"
+        ),
+    )
+    parser.add_argument(
+        "--pinky-follows-ring",
+        type=float,
+        default=0.0,
+        metavar="W",
+        help=(
+            "Blend the robot's pinky flexion toward the ring finger's: (1 - W) pinky + W ring (default 0: off). For EMG "
+            "fingers, which decode the ring best and the pinky worst: 0.25 lowered the pinky error on the 2026-11-16 "
+            "EMG teleop takes, 0.75 and 1.0 raised it"
+        ),
+    )
+    parser.add_argument(
+        "--assisted-grasp-release-rule",
+        choices=("digits", "mean"),
+        default="digits",
+        help=(
+            "How opening the hand releases a held object. digits (default): once fewer than two grasping digits stay "
+            "near their weld-time flexion, i.e. nearly every grasping digit must open. mean: once the grasping digits' "
+            "mean opening reaches --assisted-grasp-release-margin; use it with EMG fingers, which open little and the "
+            "thumb and pinky least. The G key releases at once in either case"
+        ),
+    )
+    parser.add_argument(
+        "--assisted-grasp-release-margin",
+        type=float,
+        default=0.25,
+        metavar="RAD",
+        help="How far (rad, mean over a digit's flexion joints) a digit must open from its weld-time command (default: 0.25)",
+    )
+    parser.add_argument(
+        "--assisted-grasp-criterion",
+        choices=("contact_opposition", "friction_closure"),
+        default="contact_opposition",
+        help=(
+            "Rule that allows a weld: contact_opposition (thumb touching and two opposing contact normals, "
+            "default) or friction_closure (thumb pad, closure under Coulomb friction, enough normal force "
+            "for the object's weight, grasping digits commanded past their contact)"
+        ),
+    )
+    parser.add_argument(
+        "--assisted-grasp-mu",
+        type=float,
+        default=0.5,
+        help="friction_closure: Coulomb friction coefficient (default 0.5, the PhysX default material)",
+    )
+    parser.add_argument(
+        "--assisted-grasp-weight-factor",
+        type=float,
+        default=2.0,
+        help="friction_closure: k in mu * (F_thumb + F_opp) >= k * m * g on the window mean (default 2)",
+    )
+    parser.add_argument(
+        "--assisted-grasp-force-floor",
+        type=float,
+        default=0.5,
+        metavar="N",
+        help="friction_closure: minimum window-mean normal force on the thumb and on the opposing side (default 0.5 N)",
+    )
+    parser.add_argument(
+        "--assisted-grasp-squeeze-delta-rad",
+        type=float,
+        default=0.03,
+        help=(
+            "friction_closure: minimum window-mean (target - measured) flexion of each grasping digit "
+            "(default 0.03 rad, provisional until tuned on glove debug traces)"
+        ),
     )
     parser.add_argument(
         "--assisted-grasp-squeeze-bias-rad",
@@ -696,6 +917,8 @@ def _manus_haptic_config(args):
             minimum_amplitude=args.manus_haptics_min_amplitude,
             smoothing=args.manus_haptics_smoothing,
             update_hz=args.manus_haptics_rate,
+            grasp_hold_amplitude=args.manus_haptics_grasp_hold,
+            grasp_pulse_s=args.manus_haptics_grasp_pulse,
         )
     except ValueError as error:
         raise SystemExit(f"Invalid --manus-haptics-* options: {error}") from error
@@ -712,8 +935,96 @@ def _resolve_tracking_selection(args) -> TrackingSelection:
     )
 
 
+def _vive_tracker_to_wrist(args) -> RigidTransform:
+    if args.vive_tracker_to_wrist_translation is None and args.vive_tracker_to_wrist_rotation_xyzw is None:
+        return default_tracker_to_wrist(args.hand)
+    default = default_tracker_to_wrist(args.hand)
+    try:
+        return RigidTransform(
+            default.translation
+            if args.vive_tracker_to_wrist_translation is None
+            else args.vive_tracker_to_wrist_translation,
+            (0.0, 0.0, 0.0, 1.0)
+            if args.vive_tracker_to_wrist_rotation_xyzw is None
+            else args.vive_tracker_to_wrist_rotation_xyzw,
+        )
+    except ValueError as error:
+        raise SystemExit(f"Invalid --vive-tracker-to-wrist-*: {error}") from error
+
+
+def _validate_arm_selection(arm: AratArm, tasks, args) -> None:
+    """Reject a start pose the arm does not have, and tasks it cannot reach from where it stands."""
+
+    for task in tasks:
+        names = arm.reset_pose_names(task)
+        if args.reset_pose not in names:
+            raise SystemExit(
+                f"--reset-pose {args.reset_pose} is not a start pose of arm {arm.key!r} for {task.activity}; "
+                f"choose one of: {', '.join(names)}"
+            )
+    if arm.stances is None:
+        return
+    unreachable = []
+    for task in tasks:
+        reach = task_reach(arm, task)
+        print(f"Arm {arm.key} reach, {reach.describe()}")
+        if not reach.reachable:
+            unreachable.append(task.activity)
+    if unreachable and not args.allow_unreachable:
+        raise SystemExit(
+            f"Arm {arm.key!r} cannot do: {', '.join(unreachable)} from its stance in arat/arms.yaml (see the "
+            "margins above and docs/tianji-arat.md). Use the Franka for these, or pass --allow-unreachable to "
+            "load the scene anyway."
+        )
+
+
+def _validate_dexemg_vive_selection(args, selection: TrackingSelection) -> None:
+    """Reject unused or unsafe dexemg / glove-free VIVE options before Kit starts."""
+
+    if "dexemg" in selection.wrist_sources or "vive_ultimate" in selection.articulation_sources:
+        raise SystemExit("dexemg supplies fingers only and vive supplies the wrist only")
+    dexemg_selected = "dexemg" in selection.articulation_sources
+    vive_selected = "vive_ultimate" in selection.wrist_sources
+    if not dexemg_selected and not getattr(args, "emg_bridge", False) and (
+        args.dexemg_host != "127.0.0.1"
+        or args.dexemg_port != 8765
+        or args.dexemg_startup_timeout != 30.0
+        or args.dexemg_stale_timeout != 1.0
+    ):
+        raise SystemExit("--dexemg-* options require --hand-source dexemg (or --record-hand-source dexemg) or --emg-bridge")
+    if not vive_selected and (
+        args.vive_tracker_id is not None
+        or args.vive_tracker_to_wrist_translation is not None
+        or args.vive_tracker_to_wrist_rotation_xyzw is not None
+        or args.vive_tracker_stale_timeout != 1.0
+    ):
+        raise SystemExit("--vive-tracker-* options require --wrist-source vive_ultimate (or --record-wrist-source vive_ultimate)")
+    if dexemg_selected:
+        if args.hand != "right":
+            raise SystemExit("The dexemg decoder serves a right hand only")
+        if getattr(args, "emg", False) and not getattr(args, "emg_bridge", False):
+            raise SystemExit(
+                "--emg records the band through its own Bluetooth connection, but the dexemg bridge already "
+                "owns it; use --emg-bridge to record the EMG through the bridge"
+            )
+        for name in ("dexemg_startup_timeout", "dexemg_stale_timeout"):
+            value = getattr(args, name)
+            if not math.isfinite(value) or value <= 0:
+                raise SystemExit(f"--{name.replace('_', '-')} must be positive")
+    if vive_selected:
+        if not args.vive_tracker_id:
+            raise SystemExit(
+                "--wrist-source vive_ultimate needs --vive-tracker-id (the Ultimate's serial as VIVE Hub lists it)"
+            )
+        if not math.isfinite(args.vive_tracker_stale_timeout) or args.vive_tracker_stale_timeout <= 0:
+            raise SystemExit("--vive-tracker-stale-timeout must be positive")
+        _vive_tracker_to_wrist(args)
+
+
 def _validate_manus_selection(args, selection: TrackingSelection) -> None:
     """Reject unsafe or unused MANUS option combinations before Kit starts."""
+
+    _validate_dexemg_vive_selection(args, selection)
 
     manus_selected = (
         "manus" in selection.articulation_sources or "manus" in selection.wrist_sources
@@ -860,6 +1171,23 @@ def _create_tracking_sources(args, selection: TrackingSelection) -> dict[str, ob
     """Construct each physical source once even when it serves several roles."""
 
     sources: dict[str, object] = {}
+    if "dexemg" in selection.articulation_sources:
+        sources["dexemg"] = DexemgArticulationSource(
+            args.dexemg_host,
+            args.dexemg_port,
+            startup_timeout=args.dexemg_startup_timeout,
+            stale_timeout=args.dexemg_stale_timeout,
+            handedness=args.hand,
+        )
+    if "vive_ultimate" in selection.wrist_sources:
+        sources["vive_ultimate"] = ViveUltimateWristSource(
+            args.vive_ultimate_socket,
+            tracker_id=args.vive_tracker_id,
+            frame=args.vive_ultimate_frame,
+            handedness=args.hand,
+            tracker_to_wrist=_vive_tracker_to_wrist(args),
+            stale_timeout=args.vive_tracker_stale_timeout,
+        )
     if "quest" in selection.articulation_sources or "quest" in selection.wrist_sources:
         sources["quest"] = HTSSource(
             host=args.host, port=args.port, protocol=args.protocol
@@ -968,7 +1296,7 @@ def _tracking_metadata_inputs(worker) -> dict[str, object]:
             getattr(sources[selected_articulation_source], "drain_hand_tracking", None)
         )
     )
-    manus_keys = {*worker.articulation_streams, *worker.wrist_streams} & {"manus"}
+    manus_keys = {*worker.articulation_streams, *worker.wrist_streams} & {"manus", "dexemg", "vive_ultimate"}
     return {
         "recording_metadata": {
             key: sources[key].recording_metadata() for key in manus_keys
@@ -1007,6 +1335,8 @@ def _set_hand_tracking_metadata(
                     ),
                 }
             )
+        elif key == "dexemg":
+            metadata.update(inputs["recording_metadata"][key])
         session.set_stream_metadata(stream_id, metadata)
 
     for key, stream_id in worker.wrist_streams.items():
@@ -1028,6 +1358,8 @@ def _set_hand_tracking_metadata(
                     ),
                 }
             )
+        elif key == "vive_ultimate":
+            metadata.update(inputs["recording_metadata"][key])
         session.set_stream_metadata(stream_id, metadata)
     same_callback_pairing = inputs["same_callback_pairing"]
     session.set_stream_metadata(
@@ -1079,10 +1411,29 @@ def build_environment_config(
     view_only: bool = False,
     assisted_grasp: bool = False,
     reset_pose: str = DEFAULT_RESET_POSE,
+    arm: AratArm | None = None,
 ) -> dict:
-    """Build an environment from the selected version-1 saved scene."""
+    """Build an environment from the selected version-1 saved scene.
 
-    scene_file = get_task_scene_data(task, include_task_metadata=not view_only)
+    ``arm`` selects the robot (default: the Franka at the pose saved with the task instance). An arm
+    with its own placement stands at that base pose, which also replaces the presampled robot pose
+    BehaviorTask applies at reset.
+    """
+
+    arm = ARAT_ARMS.arm() if arm is None else arm
+    base_pose = arm.base_pose(task)
+    scene_file = get_task_scene_data(
+        task,
+        include_task_metadata=not view_only,
+        robot_name=arm.robot_name,
+        robot_pose=(
+            None
+            if base_pose is None
+            else {"position": list(base_pose.position), "orientation": list(base_pose.orientation_xyzw)}
+        ),
+        # Where this arm's stance puts the apparatus on the table (None: as saved, the Franka's layout).
+        layout=arm.layout(task),
+    )
     robot_pose = (
         None if view_only else scene_file["metadata"]["task"]["robot_poses"]["robot"][0]
     )
@@ -1091,18 +1442,21 @@ def build_environment_config(
     # Sharing Kit's main viewport prevents VisionSensor from creating an
     # undocked window per camera. The configured layout assigns them below.
     viewport_name = None if os.environ.get("OMNIGIBSON_HEADLESS") == "1" else "Viewport"
+    external_sensors = build_camera_sensor_configs(
+        camera_rig,
+        camera_layout,
+        robot_prim_path=arm.prim_path,
+        viewport_name=viewport_name,
+    )
+    # The scene-frame cameras turn with a yawed stance (nothing changes for the Franka).
+    arm.place_scene_cameras(task, external_sensors)
     config = {
         # OmniGibson's default rendering frequency is 30 Hz, so the action
         # period must be a multiple of 1 / 30 seconds.
         "env": {
             "action_frequency": 30.0,
             "automatic_reset": False,
-            "external_sensors": build_camera_sensor_configs(
-                camera_rig,
-                camera_layout,
-                robot_prim_path=ROBOT_PRIM_PATH,
-                viewport_name=viewport_name,
-            ),
+            "external_sensors": external_sensors,
         },
         "scene": {
             "type": "Scene",
@@ -1118,10 +1472,7 @@ def build_environment_config(
         if view_only
         else [
             {
-                "model": ROBOT_MODEL,
-                "dataset_name": ROBOT_DATASET_NAME,
-                "end_effector": ROBOT_END_EFFECTOR,
-                "name": ROBOT_NAME,
+                **arm.robot_identity(),
                 "position": list(robot_pose["position"]),
                 "orientation": list(robot_pose["orientation"]),
                 "grasping_direction": "upper",
@@ -1134,15 +1485,15 @@ def build_environment_config(
                 "action_normalize": False,
                 "fixed_base": True,
                 "self_collisions": False,
-                "reset_joint_pos": reset_joint_positions(reset_pose),
+                "reset_joint_pos": arm.reset_joint_positions(task, reset_pose),
                 "controller_config": {
-                    "arm_0": {
+                    arm.arm_controller: {
                         "name": "InverseKinematicsController",
                         "mode": "absolute_pose",
                         "command_input_limits": None,
                         "command_output_limits": None,
                     },
-                    "gripper_0": {
+                    arm.gripper_controller: {
                         "name": "MultiFingerGripperController",
                         "mode": "independent",
                         "motor_type": "position",
@@ -1772,10 +2123,18 @@ def _finalize_recording(
     emg_session: EmgSession | None = None,
     hand_tracking_session: HandTrackingRecordingSession | None = None,
     publish: bool = True,
+    arm_record: dict | None = None,
+    failed_episodes: set[int] | None = None,
 ) -> None:
     """Close and augment the HDF5 file, then optionally publish it atomically."""
 
     recording_env.save_data()
+    if arm_record is not None:
+        write_arm_provenance(staging_path, arm_record)
+    if failed_episodes is not None:
+        from dex_teleop.omnigibson.episode_labels import write_episode_labels
+
+        write_episode_labels(staging_path, failed_episodes)
     if evaluation_episodes is not None:
         write_evaluation_episodes(staging_path, evaluation_episodes)
     if hand_pose_episodes is not None:
@@ -1795,7 +2154,8 @@ def _finalize_recording(
         hand_tracking_session.write(staging_path)
     if emg_session is not None:
         emg_session.close()
-        merge_emg_recording(staging_path, emg_session.output_path)
+        # The EMG sidecar streams from launch; keep only what lies inside the recording (from the first SPACE).
+        merge_emg_recording(staging_path, emg_session.output_path, trim_to_recording=True)
     if publish:
         os.replace(staging_path, output_path)
     if emg_session is not None:
@@ -1905,12 +2265,14 @@ def _run_task(
         SharpaAdapterConfig,
     )
 
-    print(f"\nLoading {task.activity}: {task.label} (layout: {task.layout})")
+    arm = ARAT_ARMS.arm(args.arm)
+    print(f"\nLoading {task.activity}: {task.label} (layout: {task.layout}; arm: {arm.key})")
     env = og.Environment(
         configs=build_environment_config(
             task,
             assisted_grasp=args.assisted_grasp,
             reset_pose=args.reset_pose,
+            arm=arm,
         )
     )
     if shutdown is not None:
@@ -1935,6 +2297,7 @@ def _run_task(
     env = recording_env
     print(f"Recording teleoperation to {recording_path} (staging: {staging_path.name})")
     evaluation_episodes = []
+    failed_episodes: set[int] = set()  # episodes the operator ended with F (reset + marked failed)
     assisted_grasp_episodes = [] if args.assisted_grasp_debug else None
     assisted_grasp_config = None
     grasp_config = None
@@ -1945,6 +2308,17 @@ def _run_task(
             frozen_squeeze_bias_rad=args.assisted_grasp_squeeze_bias_rad,
             weld_break_force=args.assisted_grasp_break_force,
             weld_break_torque=args.assisted_grasp_break_torque,
+            weld_mode=args.assisted_grasp_weld,
+            grasp_window_s=args.assisted_grasp_window,
+            release_rule=args.assisted_grasp_release_rule,
+            release_open_margin_rad=args.assisted_grasp_release_margin,
+            compliant_stiffness_n_per_m=args.assisted_grasp_weld_stiffness,
+            compliant_angular_stiffness_nm_per_rad=args.assisted_grasp_weld_angular_stiffness,
+            criterion=args.assisted_grasp_criterion,
+            friction_mu=args.assisted_grasp_mu,
+            friction_weight_factor=args.assisted_grasp_weight_factor,
+            friction_force_floor_n=args.assisted_grasp_force_floor,
+            friction_squeeze_delta_rad=args.assisted_grasp_squeeze_delta_rad,
         )
         if args.assisted_grasp_debug:
             from dex_teleop.omnigibson.assisted_grasp_trace import (
@@ -2000,7 +2374,10 @@ def _run_task(
         _hide_skybox_from_camera()
         robot = env.robots[0]
         _show_robot_end_effectors(robot)
-        tracking_yaw_half = math.radians(args.tracking_yaw_deg) / 2.0
+        # A yawed stance turns the operator's station with it: "forward" for the operator is
+        # forward for the robot (0 for the Franka's saved pose).
+        operator_yaw_deg = arm.operator_yaw_deg(task)
+        tracking_yaw_half = math.radians(args.tracking_yaw_deg + operator_yaw_deg) / 2.0
         tracking_to_world_quaternion_xyzw = (
             0.0,
             0.0,
@@ -2012,12 +2389,47 @@ def _run_task(
             config=SharpaAdapterConfig(
                 control_hz=30.0,
                 position_sensitivity=args.position_sensitivity,
+                pinky_follows_ring=args.pinky_follows_ring,
                 tracking_to_world_quaternion_xyzw=tracking_to_world_quaternion_xyzw,
+                # The Franka keeps the adapter's built-in clamp; another arm brings its own reach
+                # sphere and height band (hand_bench.yaml wrist_bench.arms.<arm>.workspace).
+                **(
+                    {}
+                    if arm.stances is None
+                    else {
+                        "shoulder_position": arm.workspace.shoulder_position,
+                        "shoulder_reach": arm.workspace.shoulder_reach,
+                        "minimum_z": arm.workspace.minimum_z,
+                        "maximum_z": arm.workspace.maximum_z,
+                    }
+                ),
             ),
         )
+        if arm.stances is not None:
+            stance = arm.stance(task)
+            print(
+                f"Arm {arm.key}: stance {stance.name}, base at {list(stance.base.position)} yaw "
+                f"{stance.base.yaw_deg:g} deg, reach {arm.workspace.shoulder_reach:g} m about the shoulder at "
+                f"{list(arm.workspace.shoulder_position)} (base frame), z in "
+                f"[{arm.workspace.minimum_z:g}, {arm.workspace.maximum_z:g}] m"
+                + (
+                    ""
+                    if stance.layout is None
+                    else f"; apparatus re-placed on the table for this stance: turned {stance.layout.yaw_deg:g} deg "
+                    f"about {list(stance.layout.about)}, moved by {list(stance.layout.translation)} m"
+                )
+            )
         print(f"Wrist position sensitivity: {args.position_sensitivity:g}x")
-        if args.tracking_yaw_deg:
-            print(f"Tracking frame yaw: {args.tracking_yaw_deg:g} degrees")
+        if args.tracking_yaw_deg or operator_yaw_deg:
+            print(
+                f"Tracking frame yaw: {args.tracking_yaw_deg + operator_yaw_deg:g} degrees"
+                + (
+                    f" (--tracking-yaw-deg {args.tracking_yaw_deg:g} + stance yaw {operator_yaw_deg:g}; "
+                    "the scene cameras turn with the stance)"
+                    if operator_yaw_deg
+                    else ""
+                )
+            )
         telemetry = (
             WristTelemetry(args.telemetry_interval) if args.telemetry_interval > 0 else None
         )
@@ -2060,10 +2472,24 @@ def _run_task(
             print(
                 "Assisted grasping enabled: thumb-involved opposing contacts weld the object to the "
                 "hand; grasping digits then hold their pose until the hand opens past its grasp posture"
+                if grasp_config.criterion == "contact_opposition"
+                else "Assisted grasping enabled (friction_closure): a weld needs a thumb-pad contact, closure "
+                f"under friction mu={grasp_config.friction_mu:g}, mu*(F_thumb+F_opp) >= "
+                f"{grasp_config.friction_weight_factor:g}*m*g with each side >= "
+                f"{grasp_config.friction_force_floor_n:g} N, and every grasping digit commanded "
+                f">= {grasp_config.friction_squeeze_delta_rad:g} rad past its contact; release is unchanged"
             )
-            limited = _limit_depenetration_velocity(env)
+            from dex_teleop.omnigibson.assisted_grasp import describe_weld
+
+            print(describe_weld(grasp_config))
             print(
-                f"Capped depenetration velocity at {OBJECT_MAX_DEPENETRATION_VELOCITY} m/s for: "
+                f"Assisted-grasp release: {grasp_config.release_rule} rule, open {grasp_config.release_open_margin_rad:g} rad"
+                + (" (mean over the grasping digits)" if grasp_config.release_rule == "mean" else " (all but one grasping digit)")
+                + "; G drops the held object"
+            )
+            limited = _limit_depenetration_velocity(env, args.object_depenetration_velocity)
+            print(
+                f"Capped depenetration velocity at {args.object_depenetration_velocity:g} m/s for: "
                 f"{', '.join(limited) if limited else 'no dynamic objects'}"
             )
             if args.assisted_grasp_debug:
@@ -2173,7 +2599,7 @@ def _run_task(
                 arat_labels, task.activity, evaluator.config.time_limit_s
             )
         reset_positions = th.tensor(
-            reset_joint_positions(args.reset_pose), dtype=th.float32
+            arm.reset_joint_positions(task, args.reset_pose), dtype=th.float32
         )
         control = {
             "engaged": False,
@@ -2181,6 +2607,10 @@ def _run_task(
             "pending_command": None,
             "pending_marker_toggles": set(),
             "last_marker_toggle": {"target": float("-inf"), "eef": float("-inf")},
+            # R fires on key press AND key repeat, and a reset takes seconds: repeats that arrive while
+            # it runs, or right after, would reset again and leave a zero-step episode in the recording.
+            "resetting": False,
+            "last_reset_done": float("-inf"),
         }
 
         def start_recording():
@@ -2215,6 +2645,7 @@ def _run_task(
 
         def reset():
             nonlocal previous_goal_status
+            control["resetting"] = True
             control["engaged"] = False
             control["anchor_after"] = None
             # Establish the new source boundary before flushing the current OG
@@ -2257,6 +2688,10 @@ def _run_task(
             if arm_marker_visualizer is not None:
                 arm_marker_visualizer.reset()
             print("Robot reset; press SPACE to engage teleoperation")
+            if control["pending_command"] == "reset":
+                control["pending_command"] = None  # a repeat of the same key press, queued during the reset
+            control["last_reset_done"] = time.monotonic()
+            control["resetting"] = False
 
         def request_start_or_anchor():
             # Keyboard callbacks can run from inside env.step(). Defer mutations of
@@ -2264,7 +2699,17 @@ def _run_task(
             control["pending_command"] = "start_or_anchor"
 
         def request_reset():
+            if control["resetting"] or time.monotonic() - control["last_reset_done"] < RESET_KEY_DEBOUNCE_SECONDS:
+                return
             control["pending_command"] = "reset"
+
+        def request_release():
+            control["pending_command"] = "release"
+
+        def request_reset_failed():
+            if control["resetting"] or time.monotonic() - control["last_reset_done"] < RESET_KEY_DEBOUNCE_SECONDS:
+                return
+            control["pending_command"] = "reset_failed"
 
         def request_marker_toggle(marker: str):
             now = time.monotonic()
@@ -2279,6 +2724,13 @@ def _run_task(
             KeyboardEventHandler.add_keyboard_callback(
                 lazy.carb.input.KeyboardInput.R, request_reset
             )
+            KeyboardEventHandler.add_keyboard_callback(
+                lazy.carb.input.KeyboardInput.F, request_reset_failed
+            )
+            if grasp_supervisor is not None:
+                KeyboardEventHandler.add_keyboard_callback(
+                    lazy.carb.input.KeyboardInput.G, request_release
+                )
             if arm_marker_visualizer is not None:
                 KeyboardEventHandler.add_keyboard_callback(
                     lazy.carb.input.KeyboardInput.T,
@@ -2298,7 +2750,8 @@ def _run_task(
         )
         print(
             f"Press SPACE to engage{recording_note} (SPACE again re-anchors); "
-            f"press R to reset{marker_keys}; Ctrl+C exits."
+            f"press R to reset (F: reset and mark this episode failed)"
+            f"{'; G drops the held object' if grasp_supervisor is not None else ''}{marker_keys}; Ctrl+C exits."
         )
 
         _freeze_loaded_heap()
@@ -2307,6 +2760,7 @@ def _run_task(
         previous_goal_status = None
         holding_stale_frame = False
         stale_hold_started = None
+        last_stream_check = None  # when the recorded streams were last found fresh
         engage_at = None if args.engage_after is None else time.monotonic() + args.engage_after
         if engage_at is not None:
             print(f"Engaging automatically in {args.engage_after:g} s (--engage-after)")
@@ -2320,6 +2774,14 @@ def _run_task(
             pending_command = control["pending_command"]
             control["pending_command"] = None
             if pending_command == "reset":
+                reset()
+            elif pending_command == "release":
+                if grasp_supervisor is not None and not grasp_supervisor.release_now():
+                    print("G: nothing is held")
+            elif pending_command == "reset_failed":
+                episode = len(evaluation_episodes) - 1
+                failed_episodes.add(episode)
+                print(f"Episode demo_{episode} marked FAILED (kept in the file, labelled); resetting")
                 reset()
             elif pending_command == "start_or_anchor":
                 start_or_anchor()
@@ -2337,7 +2799,15 @@ def _run_task(
                 # Native-rate comparison recordings are intentionally
                 # loss-detecting: a record-only provider that stops updating
                 # invalidates the run instead of silently truncating its stream.
+                # An iteration that itself blocked for longer than the limit leaves this process behind
+                # on the streams (a weld on the tube: 0.8-1.9 s); let it catch up before judging them.
+                if (
+                    last_stream_check is not None
+                    and time.monotonic() - last_stream_check > args.maximum_frame_age
+                ):
+                    worker.wait_for_fresh_streams(args.maximum_frame_age, STREAM_CATCH_UP_SECONDS)
                 worker.check_stream_freshness(args.maximum_frame_age)
+                last_stream_check = time.monotonic()
             if emg_session is not None:
                 emg_session.check_health()
             if not control["engaged"]:
@@ -2545,7 +3015,9 @@ def _run_task(
             if haptic_feedback is not None:
                 # Same contact view the assisted grasp uses; after the physics
                 # step so the forces belong to the action just applied.
-                haptic_feedback.step()
+                haptic_feedback.step(
+                    grasp_digits=None if grasp_supervisor is None else grasp_supervisor.holding_digits
+                )
             if grasp_trace_step is not None:
                 assisted_grasp_episodes[-1].append(
                     grasp_trace_collector.finish_after_supervisor(grasp_trace_step)
@@ -2664,6 +3136,8 @@ def _run_task(
                     publish=_may_publish_task_recording(
                         primary_error, evaluation_episodes
                     ),
+                    arm_record=arm_provenance(arm, task, args.reset_pose),
+                    failed_episodes=failed_episodes,
                 )
             except BaseException as error:
                 finalization_error = error
@@ -2717,6 +3191,8 @@ def main(argv: list[str] | None = None) -> None:
     args, launch_config = parse_launch_arguments(
         _parser(catalog), argv, skip_for_flags=PRESET_SKIP_FLAGS
     )
+    if args.emg_bridge:
+        args.emg = True
     tracking_selection = _resolve_tracking_selection(args)
     if args.display == "decoder":
         args.visualize_decoder = True
@@ -2796,6 +3272,47 @@ def main(argv: list[str] | None = None) -> None:
     tasks = catalog.resolve(args.task, args.subscale)
     if args.camera_rig is not None:
         tasks = tuple(replace(task, camera_rig=args.camera_rig) for task in tasks)
+    selected_arm = ARAT_ARMS.arm(args.arm)
+    if not args.view_only:
+        _validate_arm_selection(selected_arm, tasks, args)
+    if (
+        not math.isfinite(args.assisted_grasp_mu)
+        or args.assisted_grasp_mu <= 0
+        or not math.isfinite(args.assisted_grasp_weight_factor)
+        or args.assisted_grasp_weight_factor <= 0
+        or not math.isfinite(args.assisted_grasp_force_floor)
+        or args.assisted_grasp_force_floor < 0
+        or not math.isfinite(args.assisted_grasp_squeeze_delta_rad)
+        or args.assisted_grasp_squeeze_delta_rad < 0
+    ):
+        raise SystemExit(
+            "--assisted-grasp-mu and --assisted-grasp-weight-factor must be positive; "
+            "--assisted-grasp-force-floor and --assisted-grasp-squeeze-delta-rad non-negative"
+        )
+    if not 0.01 <= args.object_depenetration_velocity <= 100.0:
+        raise SystemExit("--object-depenetration-velocity must be between 0.01 and 100 m/s")
+    if not 0.03 <= args.assisted_grasp_window <= 2.0:
+        raise SystemExit("--assisted-grasp-window must be between 0.03 and 2 seconds")
+    if not args.assisted_grasp and args.assisted_grasp_window != 0.3:
+        raise SystemExit("--assisted-grasp-window requires --assisted-grasp")
+    if args.assisted_grasp_weld_stiffness <= 0 or args.assisted_grasp_weld_angular_stiffness <= 0:
+        raise SystemExit(
+            "--assisted-grasp-weld-stiffness and --assisted-grasp-weld-angular-stiffness must be positive"
+        )
+    if not args.assisted_grasp and (
+        args.assisted_grasp_weld != "rigid"
+        or args.assisted_grasp_weld_stiffness != 3000.0
+        or args.assisted_grasp_weld_angular_stiffness != 20.0
+    ):
+        raise SystemExit("--assisted-grasp-weld and its parameters require --assisted-grasp")
+    if not args.assisted_grasp and (
+        args.assisted_grasp_criterion != "contact_opposition"
+        or args.assisted_grasp_mu != 0.5
+        or args.assisted_grasp_weight_factor != 2.0
+        or args.assisted_grasp_force_floor != 0.5
+        or args.assisted_grasp_squeeze_delta_rad != 0.03
+    ):
+        raise SystemExit("--assisted-grasp-criterion and its parameters require --assisted-grasp")
     if args.assisted_grasp and args.view_only:
         raise SystemExit(
             "--assisted-grasp is only supported during teleoperation, not with --view-only"
@@ -2821,6 +3338,14 @@ def main(argv: list[str] | None = None) -> None:
     ):
         raise SystemExit(
             "Record-only tracking sources require --record-hand-poses or --emg"
+        )
+    if args.emg_bridge and (
+        args.emg_device is not None or args.emg_adapter != "hci0" or args.emg_sdk_path is not None
+        or args.emg_hpf is not None or args.emg_lpf is not None or args.emg_notch is not None or args.visualize_decoder
+    ):
+        raise SystemExit(
+            "--emg-bridge takes the samples from the dexemg bridge: the band, SDK, filter and decoder-preview "
+            "options of --emg do not apply (the bridge sets the filters; its window shows the decoder)"
         )
     if args.emg and args.view_only:
         raise SystemExit(
@@ -2862,6 +3387,18 @@ def main(argv: list[str] | None = None) -> None:
             "--recording-path requires a single --task; record subscale activities to separate files"
         )
     _validate_manus_selection(args, tracking_selection)
+    if not args.view_only and "dexemg" in tracking_selection.articulation_sources:
+        from dex_teleop.tracking.dexemg import probe_dexemg_bridge
+
+        print(probe_dexemg_bridge(args.dexemg_host, args.dexemg_port))
+    if not args.view_only and args.emg_bridge:
+        from dex_teleop.tracking.dexemg import probe_dexemg_bridge
+
+        print(probe_dexemg_bridge(args.dexemg_host, args.dexemg_port, require_decoder=False))
+    if not args.view_only and "vive_ultimate" in tracking_selection.wrist_sources:
+        from dex_teleop.hand_bench.wrist_bench import vive_ultimate_preflight
+
+        print(vive_ultimate_preflight(args.vive_ultimate_socket, args.vive_tracker_id))
     if (
         not args.view_only
         and "manus" in tracking_selection.wrist_sources
@@ -2885,7 +3422,11 @@ def main(argv: list[str] | None = None) -> None:
             f"{data_root}"
         )
     os.environ["OMNIGIBSON_DATA_PATH"] = str(data_root)
-    validate_runtime_assets(tasks)
+    # The Franka keeps the original call; another arm adds its own robot asset to the check.
+    if selected_arm.stances is None:
+        validate_runtime_assets(tasks)
+    else:
+        validate_runtime_assets(tasks, selected_arm)
 
     import omnigibson as og
     from omnigibson.macros import gm
@@ -2894,6 +3435,15 @@ def main(argv: list[str] | None = None) -> None:
     gm.USE_GPU_DYNAMICS = True
     gm.ENABLE_FLATCACHE = False
     gm.USE_PBR_MATERIALS = True
+    # OmniGibson's temp folder (scene file + prebuilt USD, about 860 MB for an ARAT task) outlives a simulator
+    # that is killed or crashes: remove the ones whose process is gone, and mark this run's.
+    import omnigibson as _og_package
+    from dex_teleop.omnigibson.tempdirs import mark_tempdir, remove_stale_tempdirs
+
+    _removed, _freed = remove_stale_tempdirs()
+    if _removed:
+        print(f"Removed {_removed} temporary scene folder(s) left by earlier simulator runs ({_freed / 1e9:.1f} GB)")
+    mark_tempdir(_og_package.tempdir)
     layout_name = "view_only" if args.view_only else "teleop"
     gm.GUI_VIEWPORT_ONLY = all(
         load_camera_rig(task.camera_rig)
@@ -2943,16 +3493,20 @@ def main(argv: list[str] | None = None) -> None:
                 scan_ms=args.emg_scan_ms,
                 filter_hpf=True if args.emg_hpf is None else args.emg_hpf,
                 filter_lpf=True if args.emg_lpf is None else args.emg_lpf,
-                filter_notch=args.emg_notch or "60",
+                filter_notch=args.emg_notch or "both",
                 visualize_decoder=args.visualize_decoder,
                 emg2pose_root=args.emg2pose_root,
                 emg2pose_checkpoint=args.emg2pose_checkpoint,
                 decoder_device=args.emg2pose_device or "auto",
                 decoder_hand=args.hand,
                 decoder_inference_hz=args.emg2pose_inference_hz or 5.0,
+                bridge_address=(args.dexemg_host, args.dexemg_port) if args.emg_bridge else None,
             )
             print(
-                f"Starting OYMotion EMG acquisition (staging: {emg_session.output_path.name})"
+                f"Starting EMG recording from the dexemg bridge at {args.dexemg_host}:{args.dexemg_port} "
+                f"(staging: {emg_session.output_path.name})"
+                if args.emg_bridge
+                else f"Starting OYMotion EMG acquisition (staging: {emg_session.output_path.name})"
             )
             emg_session.start(timeout=args.emg_connect_timeout)
             print(

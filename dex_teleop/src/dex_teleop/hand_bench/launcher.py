@@ -74,7 +74,8 @@ from dex_teleop.types import Handedness
 
 
 LOGGER = logging.getLogger(__name__)
-HAND_SOURCES = ("quest", "manus")
+# dexemg: fingers decoded from the wrist EMG band by the dexemg bridge (dex_teleop/scripts/dexemg_bridge.py).
+HAND_SOURCES = ("quest", "manus", "dexemg")
 HAND_MODEL = "sharpa"
 HAND_SIDE = "right"
 SCREENSHOT_SETTLE_FRAMES = 90
@@ -117,7 +118,7 @@ def reject_wrist_options(argv: list[str]) -> None:
             "The hand bench disables wrist tracking; not accepted: "
             + ", ".join(offending)
             + ". Only finger tracking is configurable: "
-            "--hand-source quest|manus (plus the HTS network and MANUS glove options)."
+            "--hand-source quest|manus|dexemg (plus the HTS network, MANUS glove and dexemg bridge options)."
         )
 
 
@@ -127,8 +128,17 @@ def _parser() -> argparse.ArgumentParser:
         "--hand-source",
         choices=HAND_SOURCES,
         default="quest",
-        help="Finger articulation provider (quest is the Quest Hand Tracking Streamer; default: quest)",
+        help=(
+            "Finger articulation provider (quest is the Quest Hand Tracking Streamer; dexemg is the wrist "
+            "EMG band decoded by the dexemg bridge; default: quest)"
+        ),
     )
+    parser.add_argument("--dexemg-host", default="127.0.0.1", help="dexemg bridge address (--hand-source dexemg)")
+    parser.add_argument("--dexemg-port", type=int, default=8765, help="dexemg bridge TCP port")
+    parser.add_argument("--dexemg-startup-timeout", type=float, default=30.0,
+                        help="Seconds to wait for the bridge's first hand (it must have recorded its neutral)")
+    parser.add_argument("--dexemg-stale-timeout", type=float, default=1.0,
+                        help="Fail when the bridge sends no hand for this long (s)")
     parser.add_argument("--retargeter", choices=SUPPORTED_RETARGETERS, default="adaptive")
     parser.add_argument(
         "--tracking-process",
@@ -241,6 +251,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Record synchronized native-rate OYMotion EMG and show it in a docked Kit window",
     )
     parser.add_argument(
+        "--emg-bridge",
+        action="store_true",
+        help=(
+            "Record the EMG through the running dexemg bridge instead of connecting to the band (implies --emg); "
+            "works with the glove and with --hand-source dexemg. Bridge address: --dexemg-host / --dexemg-port"
+        ),
+    )
+    parser.add_argument(
         "--emg-device",
         help="OYMotion device name substring or Bluetooth address (auto-selects when exactly one is found)",
     )
@@ -269,7 +287,7 @@ def _parser() -> argparse.ArgumentParser:
         "--emg-notch",
         choices=("off", "50", "60", "both"),
         default=None,
-        help="Explicit firmware mains-notch selection (default: 60)",
+        help="Explicit firmware mains-notch selection (default: both, i.e. every firmware filter on, as HandSync records)",
     )
     parser.add_argument("--emg-scan-ms", type=int, default=5000)
     parser.add_argument("--emg-connect-timeout", type=float, default=45.0)
@@ -349,8 +367,29 @@ def _validate_args(args) -> None:
         raise SystemExit("--screenshot-dir already implies a tracking-free load; drop --view-only")
     if args.display == "decoder":
         args.visualize_decoder = True
+    if args.emg_bridge:
+        args.emg = True
+        if (
+            args.emg_device is not None or args.emg_adapter != "hci0" or args.emg_sdk_path is not None
+            or args.emg_hpf is not None or args.emg_lpf is not None or args.emg_notch is not None
+            or args.visualize_decoder
+        ):
+            raise SystemExit(
+                "--emg-bridge takes the samples from the dexemg bridge: the band, SDK, filter and decoder-preview "
+                "options of --emg do not apply (the bridge sets the filters; its window shows the decoder)"
+            )
     if args.emg:
         args.record = True
+    if args.hand_source == "dexemg" and args.emg and not args.emg_bridge:
+        raise SystemExit(
+            "--emg opens its own Bluetooth connection to the band, which the dexemg bridge already owns; "
+            "use --emg-bridge to record the EMG through the bridge"
+        )
+    if args.hand_source != "dexemg" and not args.emg_bridge and (
+        args.dexemg_host != "127.0.0.1" or args.dexemg_port != 8765
+        or args.dexemg_startup_timeout != 30.0 or args.dexemg_stale_timeout != 1.0
+    ):
+        raise SystemExit("--dexemg-* options require --hand-source dexemg or --emg-bridge")
     if not args.emg and (
         args.emg_device is not None
         or args.emg_sdk_path is not None
@@ -419,6 +458,15 @@ def create_articulation_source(args):
             log_dir=args.manus_log_dir,
             right_calibration=args.manus_calibration,
             require_tracker_for_wrist=False,
+        )
+    if source == "dexemg":
+        from dex_teleop.tracking.dexemg import DexemgArticulationSource
+
+        return DexemgArticulationSource(
+            args.dexemg_host,
+            args.dexemg_port,
+            startup_timeout=args.dexemg_startup_timeout,
+            stale_timeout=args.dexemg_stale_timeout,
         )
     raise SystemExit(f"Unsupported hand source {args.hand_source!r}")
 
@@ -557,13 +605,14 @@ def create_emg_session(args, recording_path: Path) -> EmgSession:
         scan_ms=args.emg_scan_ms,
         filter_hpf=True if args.emg_hpf is None else args.emg_hpf,
         filter_lpf=True if args.emg_lpf is None else args.emg_lpf,
-        filter_notch=args.emg_notch or "60",
+        filter_notch=args.emg_notch or "both",
         visualize_decoder=args.visualize_decoder,
         emg2pose_root=args.emg2pose_root,
         emg2pose_checkpoint=args.emg2pose_checkpoint,
         decoder_device=args.emg2pose_device or "auto",
         decoder_hand=HAND_SIDE,
         decoder_inference_hz=args.emg2pose_inference_hz or 5.0,
+        bridge_address=(args.dexemg_host, args.dexemg_port) if getattr(args, "emg_bridge", False) else None,
     )
 
 
@@ -814,13 +863,21 @@ def run_bench(
             robot,
             config=SharpaFingerAdapterConfig(control_hz=30.0, finger_target_scale=args.finger_target_scale),
         )
-        control = {"engaged": True, "pending": None}
+        control = {"engaged": True, "pending": None, "last_key": {"toggle": float("-inf"), "reset": float("-inf")}}
 
-        def request_toggle():
-            control["pending"] = "toggle"
+        def request(command: str, debounce_s: float):
+            # Keyboard callbacks fire on key press and on key repeat: without a guard one press of SPACE
+            # can pause and resume again, and one press of R can open two episodes (one of them empty).
+            def callback():
+                now = time.monotonic()
+                if now - control["last_key"][command] >= debounce_s:
+                    control["last_key"][command] = now
+                    control["pending"] = command
 
-        def request_reset():
-            control["pending"] = "reset"
+            return callback
+
+        request_toggle = request("toggle", 0.5)
+        request_reset = request("reset", 1.0)
 
         if not gm.HEADLESS:
             KeyboardEventHandler.add_keyboard_callback(lazy.carb.input.KeyboardInput.SPACE, request_toggle)
@@ -1013,6 +1070,15 @@ def main(argv: list[str] | None = None) -> None:
 
     import omnigibson as og
     from omnigibson.macros import gm
+    # OmniGibson's temp folder (scene file + prebuilt USD, up to 860 MB) outlives a simulator
+    # that is killed or crashes: remove the ones whose process is gone, and mark this run's.
+    import omnigibson as _og_package
+    from dex_teleop.omnigibson.tempdirs import mark_tempdir, remove_stale_tempdirs
+
+    _removed, _freed = remove_stale_tempdirs()
+    if _removed:
+        print(f"Removed {_removed} temporary scene folder(s) left by earlier simulator runs ({_freed / 1e9:.1f} GB)")
+    mark_tempdir(_og_package.tempdir)
 
     # Rigid bodies only (no fluids or cloth), so CPU PhysX keeps the GPU footprint
     # small enough to share the card with other renders.
@@ -1036,8 +1102,17 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.emg:
             # Establish the Bluetooth connection before the long Isaac Sim startup.
+            if args.emg_bridge:
+                from dex_teleop.tracking.dexemg import probe_dexemg_bridge
+
+                print(probe_dexemg_bridge(args.dexemg_host, args.dexemg_port, require_decoder=False))
             emg_session = create_emg_session(args, recording_path)
-            print(f"Starting OYMotion EMG acquisition (staging: {emg_session.output_path.name})")
+            print(
+                f"Starting EMG recording from the dexemg bridge at {args.dexemg_host}:{args.dexemg_port} "
+                f"(staging: {emg_session.output_path.name})"
+                if args.emg_bridge
+                else f"Starting OYMotion EMG acquisition (staging: {emg_session.output_path.name})"
+            )
             emg_session.start(timeout=args.emg_connect_timeout)
             print(
                 f"EMG ready: {emg_session.metadata.get('device_name', 'OYMotion')} | "

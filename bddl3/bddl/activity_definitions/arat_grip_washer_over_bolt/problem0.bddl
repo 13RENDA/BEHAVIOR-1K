@@ -3,7 +3,6 @@
   (:objects
     arat_box.n.01_1 - arat_box.n.01
     arat_washer.n.01_1 - arat_washer.n.01
-    arat_tin.n.01_1 - arat_tin.n.01
     arat_plank.n.01_1 - arat_plank.n.01
     arat_bolt.n.01_1 - arat_bolt.n.01
     breakfast_table.n.01_1 - breakfast_table.n.01
@@ -13,10 +12,9 @@
     (inroom breakfast_table.n.01_1 empty_room)
     (open arat_box.n.01_1)
     (ontop arat_box.n.01_1 breakfast_table.n.01_1)
-    (ontop arat_tin.n.01_1 arat_box.n.01_1)
     (ontop arat_plank.n.01_1 arat_box.n.01_1)
     (ontop arat_bolt.n.01_1 arat_plank.n.01_1)
-    (ontop arat_washer.n.01_1 arat_tin.n.01_1)
+    (ontop arat_washer.n.01_1 arat_box.n.01_1)
   )
   ; Completion: the object rests at its ARAT target and the hand has released it.
   ; The 0-3 ARAT score (timing, hand-movement quality) is computed by the scorer layer.

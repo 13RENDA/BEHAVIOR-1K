@@ -94,12 +94,12 @@ def test_tianji_arm_carries_the_hand_on_the_marvin_m6_right_flange():
     assert "end_effector" not in arm.robot.environment_config()
     # The 0.754 m base plate must clear the table's rear legs (x >= -0.225).
     assert arm.robot.position[0] + 0.377 < -0.225
-    assert set(arm.reset_poses) == {"extended", "home"} and arm.default_reset_pose == "extended"
+    assert set(arm.reset_poses) == {"extended", "home", "rest"} and arm.default_reset_pose == "extended"
     assert arm.reset_poses["home"] == pytest.approx([-1.7, -1.1, 1.1, -2.0, 0.37, 0.13, -0.55])
     # Right shoulder of the Marvin Pro: 0.2 m to the right of the torso, 1.2 m above the floor;
-    # the reach sphere stays inside the 696 mm J2-to-flange reach plus the hand offset.
+    # the reach sphere stays inside the 809 mm J2-to-flange reach (M6-S CCS-809) plus the hand offset.
     assert arm.workspace.shoulder_position == pytest.approx((0.0, -0.2005, 1.203))
-    assert 0.5 < arm.workspace.shoulder_reach < 0.696 + 0.03
+    assert 0.5 < arm.workspace.shoulder_reach < 0.809 + 0.03
     assert arm.camera_rig == "wrist_bench_tianji"
 
 

@@ -60,6 +60,20 @@ def _geodesic_angle_xyzw(first: np.ndarray, second: np.ndarray) -> float:
     return 2.0 * math.acos(min(1.0, dot))
 
 
+PINKY_RING_FLEXION = tuple(
+    (SHARPA_ACTION_JOINTS.index(f"right_pinky_{joint}"), SHARPA_ACTION_JOINTS.index(f"right_ring_{joint}"))
+    for joint in ("MCP_FE", "PIP", "DIP")
+)
+
+
+def couple_pinky_to_ring(hand_positions: np.ndarray, weight: float) -> None:
+    """In place, SHARPA_ACTION_JOINTS order: pinky flexion = (1 - weight) pinky + weight ring (weight 0: no change)."""
+    if weight <= 0.0:
+        return
+    for pinky, ring in PINKY_RING_FLEXION:
+        hand_positions[pinky] = (1.0 - weight) * hand_positions[pinky] + weight * hand_positions[ring]
+
+
 @dataclass(frozen=True)
 class SharpaAdapterConfig:
     control_hz: float = 60.0
@@ -71,6 +85,10 @@ class SharpaAdapterConfig:
     maximum_z: float = 1.75
     maximum_position_step: float = 0.02
     finger_target_scale: float = 1.0
+    # Pinky flexion targets (MCP_FE, PIP, DIP) blended toward the ring finger's: (1 - w) pinky + w ring. 0 = off.
+    # EMG decoding tracks the ring best and the pinky worst; on the 2026-11-16 EMG teleop takes w = 0.25 lowered the
+    # pinky flexion error (human joint space) from 9.00 to 8.56 deg, larger w raised it (1.0: 10.97).
+    pinky_follows_ring: float = 0.0
     # The per-action limits above and in SafetyConfig are sized for one control
     # tick (1 / control_hz). With wall-clock rate limits the measured interval
     # since the previous action scales them (never below one tick, at most
@@ -148,6 +166,8 @@ class SharpaActionAdapter:
             raise ValueError("position_sensitivity must be finite and positive")
         if not 0.0 < config.finger_target_scale <= 1.0:
             raise ValueError("finger_target_scale must be in (0, 1]")
+        if not 0.0 <= config.pinky_follows_ring <= 1.0:
+            raise ValueError("pinky_follows_ring must be in [0, 1]")
         if not math.isfinite(config.rate_limit_scale_cap) or config.rate_limit_scale_cap < 1.0:
             raise ValueError("rate_limit_scale_cap must be finite and at least 1")
         self.robot = robot
@@ -239,7 +259,11 @@ class SharpaActionAdapter:
         mapped_position_world = (
             _rotate_xyzw(tracking_to_world, frame.wrist_position) * self.config.position_sensitivity
         )
-        wrist_position_robot = mapped_position_world - base_position_np
+        # World displacement in the robot base frame. The Franka's ARAT base has identity
+        # orientation, for which this rotation changes nothing; a yawed base (the Tianji's ARAT
+        # stances) needs it so a tracked motion along world +X stays along world +X.
+        base_inverse_xyzw = base_quaternion_np * np.array([-1.0, -1.0, -1.0, 1.0])
+        wrist_position_robot = _rotate_xyzw(base_inverse_xyzw, mapped_position_world - base_position_np)
         if self._position_offset is None:
             self._position_offset = eef_relative_position.cpu().numpy() - wrist_position_robot
         target_position = self._clamp_position(wrist_position_robot + self._position_offset, tick_scale)
@@ -263,6 +287,7 @@ class SharpaActionAdapter:
         hand_positions = np.array(
             [positions_by_name[name] for name in SHARPA_ACTION_JOINTS], dtype=np.float64
         ) * self.config.finger_target_scale
+        couple_pinky_to_ring(hand_positions, self.config.pinky_follows_ring)
         self._last_live_fingers = dict(zip(SHARPA_ACTION_JOINTS, hand_positions.tolist()))
         if frozen_fingers:
             unknown = set(frozen_fingers).difference(SHARPA_ACTION_JOINTS)

@@ -154,7 +154,7 @@ def test_sharpa_flange_adapter_matches_the_tianji_pattern_and_pin_direction():
     assert len(pin) > 10 and pin[:, 1].mean() == pytest.approx(0.0, abs=0.002)
 
 
-def test_merged_model_is_one_right_arm_plus_the_sharpa_hand(root):
+def test_merged_model_is_one_right_arm_plus_the_sharpa_hand(root, build_script):
     movable = [joint for joint in root.findall("joint") if joint.get("type") != "fixed"]
     names = [joint.get("name") for joint in movable]
     assert names[:7] == [f"Arm_R{i}_Joint" for i in range(1, 8)]
@@ -163,9 +163,14 @@ def test_merged_model_is_one_right_arm_plus_the_sharpa_hand(root):
     for name in ("Arm_L1_Joint", "Arm_L7_Joint", "left_gripper_left_finger_joint"):
         joint = _joint(root, name)
         assert joint.get("type") == "fixed" and joint.find("axis") is None and joint.find("limit") is None
-    left_home = yaml.safe_load((ROBOT_ASSETS / "models" / "tianji_m6_ccs" / "tianji_m6_ccs.yaml").read_text())
+    # (since 2026-11-15 the left arm hangs beside the torso instead of the upstream home pose)
     _, l1_rpy = _origin(_joint(root, "Arm_L1_Joint"))
-    assert Rotation.from_euler("xyz", l1_rpy).magnitude() == pytest.approx(abs(left_home["default_joint_pos"][0]), abs=1e-6)
+    assert Rotation.from_euler("xyz", l1_rpy).magnitude() == pytest.approx(build_script.LEFT_ARM_TUCKED_POSE[0], abs=1e-6)
+    # the long arm: 400 mm from J2 to J3, which with the 314 mm forearm and the 95 mm flange is the 809 mm reach
+    j3_xyz, _ = _origin(_joint(root, "Arm_R3_Joint"))
+    assert j3_xyz == pytest.approx([0.0, 0.400, 0.0]) and 0.400 + OFFICIAL_FOREARM_M + OFFICIAL_FLANGE_M == pytest.approx(0.809)
+    # no placeholder collision cylinder left on the forearm
+    assert all(c.find("geometry/cylinder") is None for link in root.findall("link") for c in link.findall("collision"))
     links = {link.get("name") for link in root.findall("link")}
     assert {"Arm_L7_Link", "left_gripper_base", "flange_L"} <= links
     assert not ({"flange_R", "right_gripper_base", "right_tool"} & links)

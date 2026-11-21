@@ -164,3 +164,22 @@ python dex_teleop/scripts/build_tianji_sharpa_right.py --finish-import
 ```
 
 Then `python dex_teleop/scripts/launch_wrist_bench.py --arm tianji --view-only`.
+
+## The 809 mm arm (2026-11-15)
+
+Since 2026-11-15 the model is built from `source/tianji_m6_ccs_809`: the same Marvin Pro with the Marvin
+M6-S CCS-809 arms, made by `dex_teleop/scripts/make_tianji_m6_809_source.py` from the description above and
+Tianji's own export `Pro-m6-809-gripper/urdf/Pro-m6-809.urdf` (received from the user).
+
+- The arm is the same arm with a longer upper arm: J2 to J3 is 400 mm instead of 287 mm, so J2 axis to
+  flange is 400 + 314 + 95 = 809 mm. Link2/4/5/6/7 meshes are byte-identical in both, Link1 is 3 mm and
+  Link3 112 mm longer; the other joint frames, axes and efforts are the same (checked by the script). The
+  flange and everything about the Sharpa mount above is unchanged.
+- Taken from Tianji's export: the J3 offset, the Link1 and Link3 meshes, the inertial parameters of the seven
+  links of both arms, and the forearm's collision shape (the link's mesh instead of a placeholder cylinder).
+- Kept: torso, frames, names, the teleoperation joint limits (Tianji's export allows J2 +-120 deg and
+  J4 -145..+60 deg; here both stop at -5.7 deg).
+- The bench's "extended" pose was solved again for the same palm target (24 deg from the nearest joint limit),
+  the palm reach sphere is 0.773 m (0.66 m before), and the left arm is welded hanging beside the torso.
+- `build_tianji_sharpa_right.py --tianji-urdf <source/tianji_m6_ccs/...> --right-arm-pose ... --left-arm-pose home`
+  still builds the 696 mm robot; the previous build is kept in `~/claude_work/tianji/backup_696_model/`.

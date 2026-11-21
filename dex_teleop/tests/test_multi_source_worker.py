@@ -925,3 +925,67 @@ def test_once_per_snapshot_never_holds_an_unread_command_past_its_lifetime():
         assert worker.snapshot().frame.source_frame_id == 3
     finally:
         worker.close()
+
+
+def test_unfusable_pending_articulation_yields_to_a_newer_one():
+    """A sample older than every buffered wrist (beyond the skew) must not block later samples forever."""
+
+    base = time.monotonic()
+    fingers = _FakeSource("emg")
+    wrist = _FakeSource("vive")
+    fingers.push_articulation(_articulation(base - 0.3, source="emg", frame_id=1))
+    worker = MultiSourceTrackingWorker(
+        {"emg": fingers, "vive": wrist},
+        articulation_source="emg",
+        wrist_source="vive",
+        retargeter=_FakeRetargeter(),
+        handedness=Handedness.RIGHT,
+        maximum_skew_seconds=0.05,
+        interpolation_wait_seconds=0.01,
+    )
+    worker.start()
+    try:
+        time.sleep(0.02)
+        wrist.push_wrist(_wrist(base, source="vive", frame_id=1, x=0.0))
+        wrist.push_wrist(_wrist(base + 0.01, source="vive", frame_id=2, x=1.0))
+        time.sleep(0.02)
+        fingers.push_articulation(_articulation(base + 0.005, source="emg", frame_id=2))
+        snapshot = worker.wait_for_first(1.0)
+        assert snapshot.observation.articulation.source_frame_id == 2
+        assert snapshot.frame.wrist_position[0] == pytest.approx(0.5)
+    finally:
+        worker.close()
+
+
+def test_wait_for_fresh_streams_lets_the_bookkeeping_catch_up_after_the_caller_blocked():
+    """A control loop that blocked (an assisted-grasp weld) must not blame the providers for its own stall."""
+
+    from dex_teleop.runtime.worker import _SelectedRoleChecks
+
+    class Lagging(_SelectedRoleChecks):
+        """Receipts one second behind until ``ready``: the receiving thread catching up after the caller's stall."""
+
+        articulation_source = wrist_source = "manus"
+        _articulation_keys = _wrist_keys = ("manus",)
+
+        def __init__(self, ready_after: float) -> None:
+            self.ready = time.monotonic() + ready_after
+
+        def check_stream_freshness(self, maximum_age: float) -> None:
+            now = time.monotonic()
+            receipt = now if now >= self.ready else now - 1.0
+            self._raise_if_streams_stale({("articulation", "manus"): receipt, ("wrist", "manus"): receipt}, maximum_age)
+
+    lagging = Lagging(0.05)
+    with pytest.raises(SourceUnavailableError, match="is stale"):
+        lagging.check_stream_freshness(0.25)
+    assert lagging.wait_for_fresh_streams(0.25, timeout=0.5) is True
+    lagging.check_stream_freshness(0.25)
+
+    # a provider that really stopped is still reported, after the wait
+    dead = Lagging(60.0)
+    started = time.monotonic()
+    assert dead.wait_for_fresh_streams(0.25, timeout=0.1) is False
+    assert 0.1 <= time.monotonic() - started < 0.4
+    with pytest.raises(SourceUnavailableError, match="selected articulation source 'manus' is stale"):
+        dead.check_stream_freshness(0.25)

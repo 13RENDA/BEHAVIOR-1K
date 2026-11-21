@@ -159,6 +159,11 @@ class HapticConfig:
     heartbeat_s: float = 0.5
     # Amplitude change that counts as "changed" for resend purposes.
     change_epsilon: float = 0.02
+    # Assisted grasp: while an object is held, the grasping digits vibrate at least this much (the hand
+    # no longer collides with an object on a compliant weld, so contact alone would go silent), after a
+    # full-amplitude pulse of grasp_pulse_s when the weld forms. 0 switches the grasp cue off.
+    grasp_hold_amplitude: float = 0.35
+    grasp_pulse_s: float = 0.15
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.minimum_force_n < self.maximum_force_n) or not math.isfinite(self.maximum_force_n):
@@ -173,6 +178,10 @@ class HapticConfig:
             raise ValueError("heartbeat_s must be positive and finite")
         if not 0.0 <= self.change_epsilon < 1.0:
             raise ValueError("change_epsilon must be within [0, 1)")
+        if not 0.0 <= self.grasp_hold_amplitude <= 1.0:
+            raise ValueError("grasp_hold_amplitude must be within [0, 1]")
+        if not math.isfinite(self.grasp_pulse_s) or self.grasp_pulse_s < 0.0:
+            raise ValueError("grasp_pulse_s must be non-negative and finite")
 
     def as_mapping(self) -> dict[str, float]:
         return {
@@ -183,6 +192,8 @@ class HapticConfig:
             "update_hz": self.update_hz,
             "heartbeat_s": self.heartbeat_s,
             "change_epsilon": self.change_epsilon,
+            "grasp_hold_amplitude": self.grasp_hold_amplitude,
+            "grasp_pulse_s": self.grasp_pulse_s,
         }
 
 
@@ -332,17 +343,40 @@ class ContactHapticFeedback:
         self.endpoint = endpoint
         self.last_forces = FingerContactForces.zero()
         self.last_amplitudes = HapticAmplitudes.silent()
+        self._clock = clock
+        self._held_digits: frozenset[str] = frozenset()
+        self._held_since = 0.0
 
-    def step(self, contacts: Sequence[tuple] | None = None) -> HapticAmplitudes:
+    def grasp_cue(self, grasp_digits: Iterable[str] | None) -> np.ndarray:
+        """Amplitude floor per finger from the assisted grasp: a pulse when the weld forms, then a steady hold."""
+
+        digits = frozenset(grasp_digits or ()) & frozenset(HAPTIC_FINGER_ORDER)
+        if digits and not self._held_digits:
+            self._held_since = self._clock()
+        self._held_digits = digits
+        cue = np.zeros(len(HAPTIC_FINGER_ORDER))
+        if not digits or self.config.grasp_hold_amplitude <= 0.0:
+            return cue
+        level = 1.0 if self._clock() - self._held_since < self.config.grasp_pulse_s else self.config.grasp_hold_amplitude
+        for index, finger in enumerate(HAPTIC_FINGER_ORDER):
+            if finger in digits:
+                cue[index] = level
+        return cue
+
+    def step(self, contacts: Sequence[tuple] | None = None, grasp_digits: Iterable[str] | None = None) -> HapticAmplitudes:
+        """Contact forces to amplitudes; ``grasp_digits`` are the digits holding a welded object, if any."""
+
         if contacts is None:
             contacts = self.robot.get_finger_contact_data(self.arm)
         self.last_forces = FingerContactForces.from_contacts(contacts, self.classify_link)
-        self.last_amplitudes = self.retargeter(self.last_forces)
+        contact = self.retargeter(self.last_forces)
+        self.last_amplitudes = HapticAmplitudes(np.maximum(contact.values, self.grasp_cue(grasp_digits)))
         self.sink.write(self.endpoint, self.last_amplitudes)
         self.sink.flush()
         return self.last_amplitudes
 
     def reset(self) -> None:
+        self._held_digits = frozenset()
         self.retargeter.reset()
         self.last_forces = FingerContactForces.zero()
         self.last_amplitudes = HapticAmplitudes.silent()

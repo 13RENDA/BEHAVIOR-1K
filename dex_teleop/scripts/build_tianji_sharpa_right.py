@@ -38,8 +38,9 @@ Other changes to the upstream dual-arm model:
 * The base plate, column, shoulder yoke and head of the torso get box
   colliders (expressed as a scaled unit-cube mesh, as the Franka pedestal
   does) in place of the upstream placeholder cylinder.
-* The left arm and its gripper are welded at the upstream Marvin Pro home
-  pose, so the robot is a single 7-DoF right arm + 22-DoF hand (the same 28-D
+* The left arm and its gripper are welded hanging beside the torso
+  (``LEFT_ARM_TUCKED_POSE``; the upstream Marvin Pro home pose until 2026-11-15),
+  so the robot is a single 7-DoF right arm + 22-DoF hand (the same 28-D
   IK + finger action as the Franka + Sharpa bench robot) with the whole
   Marvin Pro visible.
 * Mass-less frames keep a 1 µg placeholder mass (Sharpa's own fingertip
@@ -73,7 +74,11 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_ASSETS = REPOSITORY_ROOT / "datasets" / "omnigibson-robot-assets"
-TIANJI_SOURCE_URDF = ROBOT_ASSETS / "source" / "tianji_m6_ccs" / "tianji_m6_ccs_source.urdf"
+# The Marvin Pro with the 809 mm Marvin M6-S CCS-809 arms (since 2026-11-15; made by
+# make_tianji_m6_809_source.py). The 696 mm description this script was written for is
+# source/tianji_m6_ccs: pass it with --tianji-urdf (and --right-arm-pose) to build that arm.
+TIANJI_SOURCE_URDF = ROBOT_ASSETS / "source" / "tianji_m6_ccs_809" / "tianji_m6_ccs_source.urdf"
+TIANJI_696_SOURCE_URDF = ROBOT_ASSETS / "source" / "tianji_m6_ccs" / "tianji_m6_ccs_source.urdf"
 TIANJI_DEFINITION = ROBOT_ASSETS / "models" / "tianji_m6_ccs" / "tianji_m6_ccs.yaml"
 FRANKA_SHARPA_ROOT = ROBOT_ASSETS / "models" / "franka" / "franka_dexhand" / "franka_sharpa_right"
 SHARPA_URDF = FRANKA_SHARPA_ROOT / "source" / "right_sharpa_wave_with_flange.urdf"
@@ -160,9 +165,17 @@ PALM_LINK = "right_hand_C_MC"
 # with the largest joint-limit margin and the elbow below and outside the shoulder) for
 # right_hand_C_MC at (0.50, -0.20, 1.10) m in the base_link frame, palm normal straight down,
 # fingers along +X, thumb toward +Y: in front of the right shoulder, 0.35 m above the bench
-# table, 39 degrees from the nearest joint limit (J4). `--solve-reset-pose` re-derives it.
-DEFAULT_RIGHT_ARM_POSE = (-1.233317, -1.338584, 1.411068, -1.857169, -1.387896, 0.215559, 0.585308)
+# table, 24 degrees from the nearest joint limit (J4; 39 degrees with the 696 mm arm).
+# `--solve-reset-pose` re-derives it.
+# 809 mm arm (--solve-reset-pose, 2026-11-15). The 696 mm arm's pose for the same target was
+# (-1.233317, -1.338584, 1.411068, -1.857169, -1.387896, 0.215559, 0.585308).
+DEFAULT_RIGHT_ARM_POSE = (-1.131583, -1.55489, 1.555222, -2.114454, -1.564793, 0.022198, 0.982678)
 RESET_POSE_TARGET_POSITION = (0.50, -0.20, 1.10)
+# Arm_L1..L7 of the welded left arm: hanging beside the torso (elbow 0.81 m, gripper 0.30 m above the floor,
+# inside the base plate's outline), so that it does not keep the robot away from a table. Until 2026-11-15
+# it was welded at the upstream Marvin Pro home pose (forearm 0.5 m forward at 0.95 m, tabletop height):
+# --left-arm-pose home restores that.
+LEFT_ARM_TUCKED_POSE = (1.5708, -1.345, 0.0, -0.275, 1.7, 0.0, 0.0)
 # Rotation matrix (rows) of right_hand_C_MC in the base frame; its columns are the palm axes:
 # +X (palm normal) = -Z, +Y (pinky->thumb) = +Y, +Z (wrist->fingers) = +X.
 RESET_POSE_TARGET_ROTATION = ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0))
@@ -415,6 +428,7 @@ def build(
     output_dir: Path,
     *,
     right_arm_pose=DEFAULT_RIGHT_ARM_POSE,
+    left_arm_pose=LEFT_ARM_TUCKED_POSE,
 ) -> Path:
     if not tianji_urdf.is_file():
         raise FileNotFoundError(tianji_urdf)
@@ -434,7 +448,10 @@ def build(
 
     shift = reorigin_base_link_at_floor(root, tianji_dir)
     replace_torso_collision(root, mesh_dir)
-    weld_joints(root, load_left_home_pose(tianji_definition))
+    left_pose = load_left_home_pose(tianji_definition)
+    if left_arm_pose is not None:
+        left_pose.update({f"Arm_L{index}_Joint": float(value) for index, value in enumerate(left_arm_pose, start=1)})
+    weld_joints(root, left_pose)
     remove_right_tool(root)
     append_sharpa_hand(root, sharpa_urdf)
     patched = give_placeholder_mass(root)
@@ -655,6 +672,14 @@ def main() -> None:
         help="Arm_R1..R7 default_joint_pos for the robot definition (radians)",
     )
     parser.add_argument(
+        "--left-arm-pose",
+        nargs="+",
+        default=[str(value) for value in LEFT_ARM_TUCKED_POSE],
+        metavar="Q",
+        help="Arm_L1..L7 at which the left arm is welded (radians), or 'home' for the upstream Marvin Pro home pose "
+        "(default: hanging beside the torso)",
+    )
+    parser.add_argument(
         "--finish-import",
         action="store_true",
         help="After import_custom_robot ran, move objects/robot/<model>/{usd,misc} next to the URDF",
@@ -687,6 +712,7 @@ def main() -> None:
         sharpa_meshes.resolve(),
         args.output_dir.resolve(),
         right_arm_pose=tuple(args.right_arm_pose),
+        left_arm_pose=None if args.left_arm_pose == ["home"] else tuple(float(value) for value in args.left_arm_pose),
     )
     print(output)
 

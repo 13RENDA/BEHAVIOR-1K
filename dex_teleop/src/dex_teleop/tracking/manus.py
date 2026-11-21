@@ -19,6 +19,7 @@ Deployments:
 from __future__ import annotations
 
 import json
+import math
 import hashlib
 import logging
 import os
@@ -608,6 +609,31 @@ def _parse_topology(payload: Mapping[str, Any]) -> _GloveTopology:
     )
 
 
+def _ergonomics_provenance(ergonomics: Any) -> dict[str, Any]:
+    """The glove's latest MANUS ergonomics (20 joint angles, degrees: the EMG decoder's training labels) as
+    provenance scalars; nothing when the bridge sent none (older bridges, or before the first ergonomics)."""
+
+    if ergonomics is None:
+        return {}
+    if not isinstance(ergonomics, Mapping):
+        raise ManusProtocolError("MANUS articulation ergonomics must be an object")
+    angles = ergonomics.get("angles_deg")
+    if (
+        not isinstance(angles, list)
+        or len(angles) != 20
+        or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in angles)
+    ):
+        raise ManusProtocolError("MANUS articulation ergonomics must carry 20 finite angles")
+    return {
+        "ergonomics_deg": json.dumps([float(value) for value in angles], separators=(",", ":")),
+        "ergonomics_publish_time": _require_int(ergonomics.get("publish_time"), "articulation.ergonomics.publish_time"),
+        "ergonomics_arrival_monotonic_ns": _require_int(
+            ergonomics.get("arrival_monotonic_ns"), "articulation.ergonomics.arrival_monotonic_ns", positive=True
+        ),
+        "ergonomics_order_version": str(ergonomics.get("order_version", "")),
+    }
+
+
 def _parse_articulation(
     payload: Mapping[str, Any],
     topology: _GloveTopology,
@@ -823,6 +849,7 @@ def _parse_articulation(
         "calibration_reference_frame": (
             None if calibration is None else calibration.reference_frame
         ),
+        **_ergonomics_provenance(payload.get("ergonomics")),
     }
     source_id = f"manus_{mode}"
     articulation = HandArticulationSample(
@@ -1454,6 +1481,12 @@ class ManusIntegratedSource:
                 close_fds=True,
                 pass_fds=(write_fd,),
                 env=self._bridge_environment(),
+                # Its own session: the terminal's Ctrl+C must reach the launcher only. Delivered to the
+                # bridge as well, it stops the glove stream at once, the tracking worker fails on the closed
+                # stream, and the launcher can then no longer detach the hand-tracking recorder: the
+                # recording stays unpublished (seen 2026-11-14..16). close() stops the bridge (SIGTERM),
+                # and a bridge whose parent died stops on the closed protocol pipe (SIGPIPE).
+                start_new_session=True,
             )
         except OSError as error:
             os.close(read_fd)

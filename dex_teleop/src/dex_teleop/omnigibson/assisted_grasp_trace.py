@@ -14,7 +14,7 @@ import h5py
 
 LOGGER = logging.getLogger(__name__)
 
-ASSISTED_GRASP_SCHEMA_VERSION = 1
+ASSISTED_GRASP_SCHEMA_VERSION = 2
 ASSISTED_GRASP_GROUP = "assisted_grasp"
 ASSISTED_GRASP_STEPS_DATASET = "steps"
 
@@ -290,6 +290,15 @@ class AssistedGraspTraceCollector:
             "held_object": None,
             "held_contacts": {"points": [], "aggregate": _contact_aggregate([])},
             "external_contacts": [],
+            # Schema 2: everything both weld criteria read, on every step (welded or not), so either
+            # can be re-evaluated offline with other parameters: every hand contact per object link
+            # (digit, part, world position, reported normal, normal-force magnitude in N), the mass the
+            # grasp would carry, each digit's squeeze depth (live target - measured, flexion joints), and
+            # while welded each grasp digit's commanded flexion retreat (what the release rule compares
+            # with release_open_margin_rad).
+            "hand_contacts": [],
+            "squeeze_depth_rad": {},
+            "flexion_retreat_rad": None,
             "finger_commands_rad": {
                 "live": _float_mapping(live_fingers),
                 "measured": _float_mapping(measured_fingers),
@@ -299,6 +308,10 @@ class AssistedGraspTraceCollector:
         }
         try:
             step["supervisor_before"] = self._supervisor.diagnostic_state()
+            step["hand_contacts"] = self._supervisor.contact_snapshot()
+            step["squeeze_depth_rad"] = self._supervisor.squeeze_depth(live_fingers, measured_fingers)
+            if self._robot._ag_obj_in_hand[self._supervisor.arm] is not None:
+                step["flexion_retreat_rad"] = self._supervisor.flexion_retreat(live_fingers)
             step["joint"] = self._joint_state()
             step["eef"] = _body_state(self._robot.eef_links[self._supervisor.arm])
             held = self._robot._ag_obj_in_hand[self._supervisor.arm]
@@ -426,4 +439,207 @@ def _contact_aggregate(contacts: list[dict]) -> dict:
         "sum_force_norm_n": sum(contact["force_norm_n"] for contact in contacts),
         "max_force_norm_n": max(contact["force_norm_n"] for contact in contacts),
         "min_separation_m": min(contact["separation_m"] for contact in contacts),
+    }
+
+
+# --------------------------------------------------------------------------- offline criterion comparison
+
+VIRTUAL_RELEASE_MARGINS_RAD = (0.10, 0.15, 0.25)
+
+
+def _trace_contacts(entry: Mapping) -> list:
+    from dex_teleop.omnigibson.assisted_grasp import DigitContact
+
+    contacts = []
+    for row in entry.get("contacts", []):
+        contacts.append(
+            DigitContact(
+                digit=row["digit"],
+                part=row["part"],
+                normal=None if row.get("normal") is None else tuple(row["normal"]),
+                position=None if row.get("position_m") is None else tuple(row["position_m"]),
+                force_n=float(row.get("force_n", 0.0)),
+            )
+        )
+    return contacts
+
+
+def compare_criteria_episode(
+    steps: list[dict],
+    config: Mapping[str, object],
+    *,
+    release_margins_rad: tuple[float, ...] = VIRTUAL_RELEASE_MARGINS_RAD,
+) -> dict:
+    """Re-evaluate both weld criteria on one recorded episode, without the simulator.
+
+    Each criterion is replayed on the recorded hand contacts and finger commands with the recording's own
+    parameters (``config`` may be edited to try others). A criterion "holds" at a step when its full
+    decision is satisfied there: for ``contact_opposition`` the thumb touches and two digits oppose on
+    one graspable object link for a whole ``grasp_window_s``; for ``friction_closure`` thumb pad and
+    closure hold on every step of the window and force and intent hold on the window mean.
+
+    Caveat stated in the result: after the recorded weld the grasping fingers were frozen and the object
+    was attached, so contacts from then on are not what the other criterion would have produced. The
+    comparison is exact up to the first recorded weld and indicative after it.
+    """
+
+    from dataclasses import fields
+
+    from dex_teleop.omnigibson.assisted_grasp import (
+        THUMB,
+        AssistedGraspConfig,
+        can_hold_digits,
+        evaluate_friction_closure,
+        friction_window_verdict,
+        has_opposition,
+    )
+
+    known = {field.name for field in fields(AssistedGraspConfig)}
+    grasp_config = AssistedGraspConfig(**{key: value for key, value in config.items() if key in known})
+    if not steps:
+        return {"steps": 0, "evaluable": False, "reason": "empty episode"}
+    if "hand_contacts" not in steps[0]:
+        return {
+            "steps": len(steps),
+            "evaluable": False,
+            "reason": "trace schema 1 has no pre-weld contacts; record again with this version",
+        }
+    times = [float(step["episode_time_s"]) for step in steps]
+    dt = (times[-1] - times[0]) / (len(times) - 1) if len(times) > 1 else 1.0 / 30.0
+    window_steps = max(1, math.ceil(grasp_config.grasp_window_s / dt - 1e-9))
+
+    old_run: dict[tuple, int] = {}
+    new_run: dict[tuple, list] = {}
+    last_break: dict[tuple, str] = {}  # why (a)/(b) last failed per object link
+    first_contact = first_old = first_new = None
+    old_only = {"thumb_part": 0, "closure": 0, "force": 0, "intent": 0}
+    new_only = 0
+    both = 0
+    old_steps = new_steps = 0
+    for index, step in enumerate(steps):
+        squeeze = step.get("squeeze_depth_rad", {})
+        seen = set()
+        old_holds = new_holds = False
+        causes = set()
+        for entry in step["hand_contacts"]:
+            if not entry.get("graspable", True):
+                continue
+            key = (entry["object"], entry["link_name"])
+            seen.add(key)
+            contacts = _trace_contacts(entry)
+            if first_contact is None and contacts:
+                first_contact = index
+            old_ok = (not grasp_config.require_thumb or any(c.digit == THUMB for c in contacts)) and has_opposition(
+                contacts, grasp_config.opposition_max_normal_dot
+            )
+            old_run[key] = old_run.get(key, 0) + 1 if old_ok else 0
+            link_old = old_run[key] >= window_steps
+            evaluation = evaluate_friction_closure(
+                contacts, mu=grasp_config.friction_mu, margin=grasp_config.friction_closure_margin
+            )
+            link_new = False
+            cause = None
+            if evaluation.passes:
+                run = new_run.setdefault(key, [])
+                run.append((evaluation, squeeze))
+                del run[:-window_steps]
+                if len(run) >= window_steps:
+                    verdict = friction_window_verdict(
+                        [item for item, _ in run],
+                        [item for _, item in run],
+                        mass_kg=float(entry.get("mass_kg") or float("nan")),
+                        config=grasp_config,
+                    )
+                    link_new = verdict["weld"]
+                    if not link_new:
+                        cause = "force" if not verdict["force_ok"] else "intent"
+                else:
+                    # (a) and (b) have not yet held for a whole window: the step that broke the run decides
+                    cause = last_break.get(key, "closure")
+            else:
+                new_run[key] = []
+                cause = "thumb_part" if not evaluation.thumb_pad else "closure"
+                last_break[key] = cause
+            old_holds |= link_old
+            new_holds |= link_new
+            if link_old and not link_new and cause is not None:
+                causes.add(cause)
+        for key in [k for k in old_run if k not in seen]:
+            old_run[key] = 0
+        for key in [k for k in new_run if k not in seen]:
+            new_run[key] = []
+        old_steps += old_holds
+        new_steps += new_holds
+        if old_holds and first_old is None:
+            first_old = index
+        if new_holds and first_new is None:
+            first_new = index
+        if old_holds and new_holds:
+            both += 1
+        elif old_holds:
+            for cause in ("thumb_part", "closure", "force", "intent"):
+                if cause in causes:
+                    old_only[cause] += 1
+                    break
+        elif new_holds:
+            new_only += 1
+
+    events = [step.get("supervisor_event") for step in steps]
+    kinds = [event.get("kind") for event in events if event]
+    recorded_weld = next((i for i, event in enumerate(events) if event and event.get("kind") in {"welded", "adopted"}), None)
+
+    def seconds(index):
+        return None if index is None or first_contact is None else (index - first_contact) * dt
+
+    virtual = {}
+    for margin in release_margins_rad:
+        drops = 0
+        segments = set()
+        elapsed = 0.0
+        dropped = False
+        segment = 0
+        was_held = False
+        for step in steps:
+            retreat = step.get("flexion_retreat_rad")
+            if retreat is None:
+                was_held, elapsed, dropped = False, 0.0, False
+                continue
+            if not was_held:
+                segment += 1
+                was_held = True
+            digits = set((step.get("supervisor_before") or {}).get("grasp_digits", retreat.keys()))
+            engaged = {digit for digit in digits if digit not in retreat or float(retreat[digit]) <= margin}
+            if can_hold_digits(engaged):
+                elapsed, dropped = 0.0, False
+                continue
+            elapsed += dt
+            if elapsed >= grasp_config.release_window_s - 1e-9 and not dropped:
+                drops += 1
+                dropped = True
+                segments.add(segment)
+        virtual[f"{margin:.2f}"] = {"drops": drops, "weld_segments_affected": len(segments)}
+
+    return {
+        "steps": len(steps),
+        "evaluable": True,
+        "control_dt_s": dt,
+        "window_steps": window_steps,
+        "recorded_criterion": config.get("criterion", "contact_opposition"),
+        "first_contact_step": first_contact,
+        "recorded_first_weld_step": recorded_weld,
+        "contact_to_first_weld_s": {
+            "contact_opposition": seconds(first_old),
+            "friction_closure": seconds(first_new),
+            "recorded": seconds(recorded_weld),
+        },
+        "steps_holding": {"contact_opposition": old_steps, "friction_closure": new_steps, "both": both},
+        "contact_opposition_only_steps_by_cause": old_only,
+        "friction_closure_only_steps": new_only,
+        "events": {
+            "welded": kinds.count("welded") + kinds.count("adopted"),
+            "released": kinds.count("released"),
+            "broke": kinds.count("broke"),
+        },
+        "virtual_releases_by_margin_rad": virtual,
+        "caveat": "exact up to the first recorded weld; afterwards fingers were frozen and the object welded",
     }

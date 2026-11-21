@@ -944,6 +944,11 @@ def write_multi_source_hand_recording(
                 )
             expected_steps = int(trajectory.attrs["num_samples"])
             action = trajectory.get("action")
+            if expected_steps == 0 and action is None:
+                # An episode that was opened (R, or a reset before quitting) but never stepped: the
+                # trajectory wrapper writes no action dataset for it. It is a valid, empty episode.
+                trajectory_lengths.append((episode_id, 0))
+                continue
             if not isinstance(action, h5py.Dataset) or action.ndim < 1:
                 raise ValueError(
                     f"Trajectory demo_{episode_id} has no row-aligned action dataset"

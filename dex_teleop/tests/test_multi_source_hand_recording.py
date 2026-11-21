@@ -624,3 +624,41 @@ def test_writer_verifies_num_samples_against_the_actual_action_rows(tmp_path):
             recording[HAND_TRACKING_GROUP].attrs["sentinel"]
             == "preserve-on-trajectory-error"
         )
+
+
+def test_writer_accepts_episodes_that_were_opened_but_never_stepped(tmp_path):
+    """R twice, or R before Ctrl+C, leaves a zero-step episode without an action dataset (11-14 cricket ball)."""
+
+    path = tmp_path / "recording.hdf5"
+    _write_trajectory(path, lengths=((0, 2), (2, 2)))
+    with h5py.File(path, "r+") as recording:
+        for episode_id in (1, 3):
+            recording["data"].create_group(f"demo_{episode_id}").attrs["num_samples"] = 0
+    articulation, wrists, retargeting, selections = _fixture_streams()
+
+    write_multi_source_hand_recording(
+        path,
+        articulation_streams=articulation,
+        wrist_streams=wrists,
+        retargeting_streams=retargeting,
+        action_alignment_episodes=[selections, [], selections, []],
+    )
+
+    with h5py.File(path, "r") as recording:
+        alignment = recording[HAND_TRACKING_GROUP]["action_alignment"]
+        assert sorted(alignment.keys()) == ["demo_0", "demo_1", "demo_2", "demo_3"]
+        assert alignment["demo_1/articulation_stream"].shape == (0,)
+        assert alignment["demo_0/articulation_stream"].shape == (2,)
+
+    # a zero-step episode that does carry steps in the session is still an error
+    _write_trajectory(path, lengths=((0, 2),))
+    with h5py.File(path, "r+") as recording:
+        recording["data"].create_group("demo_1").attrs["num_samples"] = 0
+    with pytest.raises(RuntimeError, match="demo_1 has 2 steps"):
+        write_multi_source_hand_recording(
+            path,
+            articulation_streams=articulation,
+            wrist_streams=wrists,
+            retargeting_streams=retargeting,
+            action_alignment_episodes=[selections, selections],
+        )

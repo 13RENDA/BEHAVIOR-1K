@@ -47,8 +47,12 @@ class EmgSession:
         decoder_inference_hz: float = 5.0,
         filter_hpf: bool = True,
         filter_lpf: bool = True,
-        filter_notch: str = "60",
+        filter_notch: str = "both",
+        bridge_address: tuple[str, int] | None = None,
     ) -> None:
+        # bridge_address: take the samples from a running dexemg bridge (which owns the band) instead of
+        # connecting to the band; device/adapter/SDK/filter options are then the bridge's business.
+        self.bridge_address = None if bridge_address is None else (str(bridge_address[0]), int(bridge_address[1]))
         if scan_ms <= 0 or preview_capacity <= 0:
             raise ValueError("EMG scan period and preview capacity must be positive")
         self.output_path = Path(output_path).expanduser().resolve()
@@ -142,13 +146,28 @@ class EmgSession:
             "--filter-notch",
             self.filter_notch,
         ]
-        if self.device:
+        if self.bridge_address is not None:
+            command = [
+                sys.executable,
+                "-u",
+                "-m",
+                "dex_teleop.emg.bridge_sidecar",
+                "--output",
+                str(self.output_path),
+                "--preview-port",
+                str(receiver_socket.getsockname()[1]),
+                "--bridge-host",
+                self.bridge_address[0],
+                "--bridge-port",
+                str(self.bridge_address[1]),
+            ]
+        elif self.device:
             command.extend(("--device", self.device))
-        if self.adapter:
+        if self.bridge_address is None and self.adapter:
             command.extend(("--adapter", self.adapter))
-        if self.sdk_path is not None:
+        if self.bridge_address is None and self.sdk_path is not None:
             command.extend(("--sdk-path", str(self.sdk_path)))
-        if self.visualize_decoder:
+        if self.bridge_address is None and self.visualize_decoder:
             command.extend(("--visualize-decoder", "--decoder-device", self.decoder_device))
             command.extend(("--decoder-hand", self.decoder_hand))
             command.extend(("--decoder-inference-hz", str(self.decoder_inference_hz)))
@@ -160,7 +179,10 @@ class EmgSession:
         source_root = str(Path(__file__).resolve().parents[2])
         python_path = environment.get("PYTHONPATH")
         environment["PYTHONPATH"] = source_root if not python_path else os.pathsep.join((source_root, python_path))
-        self._process = subprocess.Popen(command, env=environment)
+        # Its own session, so the terminal's Ctrl+C reaches the launcher only: the sidecar keeps recording
+        # until close() stops it (SIGTERM) after the last simulator step, instead of exiting mid-shutdown
+        # (which check_health would report as a failed EMG recording).
+        self._process = subprocess.Popen(command, env=environment, start_new_session=True)
 
         deadline = time.monotonic() + timeout
         with self._condition:

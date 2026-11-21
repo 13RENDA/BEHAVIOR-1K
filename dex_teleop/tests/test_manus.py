@@ -1421,3 +1421,18 @@ def test_manus_source_does_not_retain_multiline_license_data_in_errors():
     source._stderr_loop()
 
     assert tuple(source._stderr_tail) == ("normal diagnostic", "safe tail")
+
+
+def test_bridge_runs_in_its_own_session_so_ctrl_c_reaches_the_launcher_only():
+    """Ctrl+C in the terminal must not stop the glove stream before the launcher has saved its recording."""
+    import os
+
+    source = _source()
+    source.start()
+    try:
+        process = source._process
+        assert os.getsid(process.pid) != os.getsid(0)
+        assert os.getpgid(process.pid) != os.getpgrp()
+    finally:
+        source.close()
+    assert process.poll() is not None  # close() still stops it

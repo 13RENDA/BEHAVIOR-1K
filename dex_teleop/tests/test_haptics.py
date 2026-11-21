@@ -202,3 +202,44 @@ def test_process_worker_forwards_amplitudes_to_the_tracking_process():
         assert sink.get(timeout=5.0) == ("right", [0.25, 0.5, 0.75, 1.0, 0.0])
         time.sleep(0.05)
         worker.check_health()
+
+
+def test_grasp_cue_pulses_on_the_weld_then_holds_on_the_grasping_digits():
+    class _Robot:
+        contacts = []
+
+        def get_finger_contact_data(self, arm):
+            return self.contacts
+
+    worker = _RecordingWorker()
+    now = [10.0]
+    controller = ContactHapticFeedback(
+        _Robot(), SEMANTICS.classify_link, ManusGloveHapticDevice(worker, endpoint="right"), arm="right_arm",
+        endpoint="right", config=HapticConfig(update_hz=1000.0, grasp_hold_amplitude=0.4, grasp_pulse_s=0.15),
+        clock=lambda: now[0],
+    )
+    assert not controller.step(grasp_digits=()).active  # nothing held, nothing touched
+    # the weld forms on thumb + index: both pulse at full amplitude although no contact force is reported
+    assert controller.step(grasp_digits=("index", "thumb")).as_list() == [1.0, 1.0, 0.0, 0.0, 0.0]
+    now[0] += 0.10
+    assert controller.step(grasp_digits=("index", "thumb")).as_list() == [1.0, 1.0, 0.0, 0.0, 0.0]
+    now[0] += 0.10  # the pulse is over: steady hold
+    assert controller.step(grasp_digits=("index", "thumb")).as_list() == [0.4, 0.4, 0.0, 0.0, 0.0]
+    # contact on another finger still comes through, and a stronger contact wins over the hold level
+    _Robot.contacts = [_contact("right_middle_elastomer", (0.0, 0.0, 6.0))]
+    assert controller.step(grasp_digits=("index", "thumb")).as_list() == [0.4, 0.4, 1.0, 0.0, 0.0]
+    # released: only contact is left
+    _Robot.contacts = []
+    now[0] += 1.0
+    released = controller.step(grasp_digits=())
+    assert released.values[0] == 0.0 and released.values[1] == 0.0
+    # a new weld pulses again; the cue can be switched off
+    now[0] += 1.0
+    assert controller.step(grasp_digits=("thumb", "ring", "palm")).as_list()[0] == 1.0
+    silent = ContactHapticFeedback(
+        _Robot(), SEMANTICS.classify_link, ManusGloveHapticDevice(_RecordingWorker(), endpoint="right"), arm="right_arm",
+        config=HapticConfig(grasp_hold_amplitude=0.0), clock=lambda: now[0],
+    )
+    assert not silent.step(grasp_digits=("index", "thumb")).active
+    with pytest.raises(ValueError, match="grasp_hold_amplitude"):
+        HapticConfig(grasp_hold_amplitude=1.5)

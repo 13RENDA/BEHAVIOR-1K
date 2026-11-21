@@ -489,8 +489,9 @@ def build_tasks() -> list[dict]:
             ],
             "instances": {
                 "arat_box.n.01_1": "arat_box",
-                "arat_cup.n.01_1": "plastic_tumbler_1",
-                "arat_cup.n.01_2": "plastic_tumbler_2",
+                # The source cup is the red one on the tested (right) side.
+                "arat_cup.n.01_1": "plastic_tumbler_2",
+                "arat_cup.n.01_2": "plastic_tumbler_1",
             },
         },
         {
@@ -522,9 +523,10 @@ def build_tasks() -> list[dict]:
         {
             "item": 10,
             "activity": "arat_grip_washer_over_bolt",
+            # 2026-11-17 (user): the washer lies flat on the box cover where the tin lid used to be; from inside the
+            # tin it cannot be picked up in practice, so the tin is not part of this task any more.
             "objects": [
                 arat_box(),
-                tin_lid_1(name="tin_lid"),
                 dataset_object(
                     "plank_target_point",
                     "arat_plank",
@@ -556,14 +558,13 @@ def build_tasks() -> list[dict]:
                     [
                         TIN_LID_1_AABB_CENTER_X,
                         TIN_LID_1_CENTER_Y,
-                        TIN_LID_1_CENTER_Z + TIN_FIXED_SUPPORT_CLEARANCE + 0.0008 + CONTACT_CLEARANCE,
+                        TIN_LID_1_CENTER_Z + CONTACT_CLEARANCE,
                     ],
                 ),
             ],
             "instances": {
                 "arat_box.n.01_1": "arat_box",
                 "arat_washer.n.01_1": "washer",
-                "arat_tin.n.01_1": "tin_lid",
                 "arat_plank.n.01_1": "plank_target_point",
                 "arat_bolt.n.01_1": "bolt_target_point",
             },
@@ -667,7 +668,7 @@ def normalize_saved_scene(path: Path, task_metadata: dict | None = None) -> dict
 def add_four_ounces_of_water(env) -> dict:
     water = env.scene.get_system("water")
     radius = float(water.particle_radius)
-    center_x, center_y = CUP_CENTER_X, TUMBLER_1_CENTER_Y
+    center_x, center_y = CUP_CENTER_X, TUMBLER_2_CENTER_Y  # the red cup, on the tested (right) side
     spacing = 2.0 * radius
     z0 = ARAT_BOX_COVER_SURFACE_Z + CONTACT_CLEARANCE + 0.004 + radius
     positions = []
@@ -916,7 +917,8 @@ def main() -> None:
             ],
             "inner_edges_from_midline_m": CUP_INNER_EDGE_FROM_BOX_MIDLINE,
             "front_edges_from_table_proximal_edge_m": CUP_FRONT_EDGE_DISTANCE,
-            "tumbler_1_contains_water": True,
+            "tumbler_1_contains_water": False,
+            "tumbler_2_contains_water": True,
         },
         "tube_placement": {
             "plank_starting_dimensions_depth_width_height_m": [0.06, 0.085, 0.015],
@@ -943,9 +945,10 @@ def main() -> None:
             "tube_initially_pegged_on_start_bolt": True,
         },
         "washer_placement": {
-            "tin_lid_front_edge_from_table_proximal_edge_m": FRONT_EDGE_DISTANCE,
-            "tin_lid_centroid_from_box_rightmost_edge_m": RIGHT_EDGE_TO_CENTROID,
-            "washer_centered_inside_tin_lid": True,
+            "washer_on_box_cover_without_tin_lid": True,
+            "washer_center_xy_m": [TIN_LID_1_AABB_CENTER_X, TIN_LID_1_CENTER_Y],
+            "washer_front_edge_from_table_proximal_edge_m": FRONT_EDGE_DISTANCE,
+            "washer_centroid_from_box_rightmost_edge_m": RIGHT_EDGE_TO_CENTROID,
             "plank_target_dimensions_depth_width_height_m": [0.085, 0.085, 0.015],
             "plank_target_back_edge_aligned_with_lid_back_edge": False,
             "plank_target_forward_shift_from_lid_back_edge_m": TARGET_PLANK_FORWARD_SHIFT,
@@ -953,7 +956,7 @@ def main() -> None:
             "bolt_target_diameter_height_m": [0.008, 0.085],
             "bolt_target_center_xy_m": [WASHER_PLANK_CENTER_X, WASHER_PLANK_CENTER_Y],
             "bolt_target_centroid_from_box_rightmost_edge_m": RIGHT_EDGE_TO_CENTROID,
-            "fixed_members": ["tin_lid", "plank_target_point", "bolt_target_point"],
+            "fixed_members": ["plank_target_point", "bolt_target_point"],
         },
         "gross_movement_placement": {
             "activities": list(GROSS_MOVEMENT_ACTIVITIES),

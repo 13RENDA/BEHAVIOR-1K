@@ -46,17 +46,25 @@ def reset_joint_positions(name: str = DEFAULT_RESET_POSE) -> list[float]:
         raise ValueError(f"Unknown reset pose {name!r}; expected one of: {known}") from error
 
 
-def add_reset_pose_argument(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add ``--reset-pose`` with the compact/extended aliases."""
+def add_reset_pose_argument(parser: argparse.ArgumentParser, extra_choices=()) -> argparse.ArgumentParser:
+    """Add ``--reset-pose`` with the compact/extended aliases (plus other arms' start poses, ``extra_choices``)."""
 
+    extra = tuple(name for name in extra_choices if name not in RESET_POSES)
     parser.add_argument(
         "--reset-pose",
-        choices=tuple(RESET_POSES),
+        choices=tuple(RESET_POSES) + extra,
         default=DEFAULT_RESET_POSE,
         help=(
             "Franka + Sharpa start configuration: 'compact' is the OmniGibson asset "
             "ready pose; 'extended' is the Deoxys tabletop golden pose "
             f"(default: {DEFAULT_RESET_POSE})"
+            + (
+                f". Other arms have their own start poses in arat/arms.yaml ({', '.join(extra)}): 'rest' lays the "
+                "open hand just above the table beside the object, as the operator's hand lies while the EMG "
+                "neutral is recorded"
+                if extra
+                else ""
+            )
         ),
     )
     return parser

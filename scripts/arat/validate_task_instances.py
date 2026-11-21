@@ -262,7 +262,6 @@ def static_validation() -> tuple[dict, list[Path]]:
             requested_names = {
                 "table",
                 "arat_box",
-                "tin_lid",
                 "washer",
                 "plank_target_point",
                 "bolt_target_point",
@@ -470,8 +469,8 @@ def static_validation() -> tuple[dict, list[Path]]:
         raise AssertionError("Tube fixture alignment metadata is incomplete")
 
     washer = manifest["washer_placement"]
-    close(washer["tin_lid_front_edge_from_table_proximal_edge_m"], 0.05, "washer lid A-to-B")
-    close(washer["tin_lid_centroid_from_box_rightmost_edge_m"], 0.10, "washer lid X-to-C")
+    close(washer["washer_front_edge_from_table_proximal_edge_m"], 0.05, "washer A-to-B")
+    close(washer["washer_centroid_from_box_rightmost_edge_m"], 0.10, "washer X-to-C")
     close(washer["plank_target_dimensions_depth_width_height_m"], [0.085, 0.085, 0.015], "washer plank")
     close(washer["bolt_target_diameter_height_m"], [0.008, 0.085], "washer bolt")
     close(washer["bolt_target_center_xy_m"], TARGET_BOLT_CENTER, "washer bolt center")
@@ -962,10 +961,11 @@ def runtime_validation(paths: list[Path]) -> list[dict]:
                 raise AssertionError(f"Pouring proxy is {represented_ml} mL, more than 0.5% from {WATER_REQUIRED_ML} mL")
             n_in_tumbler_1 = int(tumbler_1.states[ContainedParticles].get_value(water).n_in_volume)
             n_in_tumbler_2 = int(tumbler_2.states[ContainedParticles].get_value(water).n_in_volume)
-            if n_in_tumbler_1 != WATER_PROXY_PARTICLES or n_in_tumbler_2 != 0:
+            # The water starts in the red cup on the tested (right) side.
+            if n_in_tumbler_2 != WATER_PROXY_PARTICLES or n_in_tumbler_1 != 0:
                 raise AssertionError(f"Water containment mismatch: tumbler1={n_in_tumbler_1}, tumbler2={n_in_tumbler_2}")
-            if not tumbler_1.states[Filled].get_value(water):
-                raise AssertionError("plastic_tumbler_1 does not load in the Filled state")
+            if not tumbler_2.states[Filled].get_value(water):
+                raise AssertionError("plastic_tumbler_2 does not load in the Filled state")
             water_validation = {
                 "required_us_fluid_ounces": 4.0,
                 "required_volume_ml": WATER_REQUIRED_ML,
@@ -974,7 +974,7 @@ def runtime_validation(paths: list[Path]) -> list[dict]:
                 "relative_volume_error_percent": 100.0 * (represented_ml - WATER_REQUIRED_ML) / WATER_REQUIRED_ML,
                 "particles_in_plastic_tumbler_1": n_in_tumbler_1,
                 "particles_in_plastic_tumbler_2": n_in_tumbler_2,
-                "plastic_tumbler_1_filled": True,
+                "plastic_tumbler_2_filled": True,
             }
         elif systems:
             raise AssertionError(f"Unexpected systems in {path.name}: {systems}")

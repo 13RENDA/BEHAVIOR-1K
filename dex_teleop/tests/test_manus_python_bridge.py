@@ -215,6 +215,26 @@ def test_integrated_python_bridge_streams_the_glove(fake_sdk):
     assert (coordinates["view"], coordinates["up"], coordinates["handedness"]) == (6, 5, 2)  # ZToViewer, +Y, right-handed
 
 
+def test_glove_frames_carry_the_gloves_ergonomics_angles(fake_sdk):
+    """The 20 MANUS ergonomics angles (the EMG decoder's training labels) ride on every glove frame's provenance."""
+    from dex_teleop.tracking.manus_python_bridge import ERGONOMICS_ORDER
+
+    source = _source()
+    frames = []
+    with source:
+        assert _wait(lambda: frames.extend(source.drain_hand_tracking(Handedness.RIGHT).articulations) or len(frames) > 5)
+    carried = [f for f in frames if "ergonomics_deg" in f.provenance]
+    assert len(carried) >= len(frames) - 1 and carried  # all but possibly a frame before the first ergonomics
+    for frame in carried[-3:]:
+        provenance = frame.provenance
+        angles = json.loads(provenance["ergonomics_deg"])
+        frame_index = provenance["ergonomics_publish_time"] - 555000000
+        assert angles == pytest.approx([10.0 + k + frame_index / 100.0 for k in range(20)])  # the right hand's 20, not the user entry
+        assert provenance["ergonomics_order_version"] == "manus-sdk-3.2-ergonomics-side20-degrees"
+        assert provenance["ergonomics_arrival_monotonic_ns"] <= frame.receipt_timestamp * 1e9 + 1e6
+    assert len(ERGONOMICS_ORDER) == 20 and ERGONOMICS_ORDER[0] == "ThumbCMCSpread" and ERGONOMICS_ORDER[-1] == "PinkyDIPStretch"
+
+
 def test_integrated_python_bridge_reports_a_missing_license(fake_sdk, monkeypatch):
     monkeypatch.setenv("DEX_TELEOP_FAKE_MANUS_SCENARIO", "no_license")
     source = _source(startup_timeout=10.0, glove_timeout=2)

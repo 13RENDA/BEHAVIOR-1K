@@ -90,6 +90,9 @@ CAMERA_LAYOUT = "teleop"
 ARMS: WristBenchArms = load_wrist_bench_arms()
 DEFAULT_ARM = ARMS.default_arm
 MINIMUM_PALM_CLEARANCE_M = 0.15
+# ... except from a `rest` start pose, which lays the hand just above the table on purpose
+RESTING_PALM_CLEARANCE_M = 0.05
+REST_POSE = "rest"
 PRESET_SKIP_FLAGS = ("--view-only",)
 WAIT_MESSAGE_INTERVAL_SECONDS = 5.0
 # How long the pre-flight listens on VIVE Hub's socket for the expected tracker
@@ -112,6 +115,31 @@ def reset_joint_positions(arm: WristBenchArm, reset_pose: str | None = None) -> 
     return arm.reset_joint_positions(reset_pose)
 
 
+# Objects the bench can put on the table for grasp checks (--grasp-object): ARAT assets, name -> (category, model).
+GRASP_OBJECT_NAME = "grasp_object"
+GRASP_OBJECT_DATASET = "arat-assets-v1"
+GRASP_OBJECTS = {
+    "block_2_5": ("arat_wooden_block", "wooden_block_2_5"),
+    "block_5": ("arat_wooden_block", "wooden_block_5_0"),
+    "block_7_5": ("arat_wooden_block", "wooden_block_7_5"),
+    "block_10": ("arat_wooden_block", "wooden_block_10"),
+    "cricket_ball": ("arat_cricket_ball", "cricket_ball"),
+    "sharpening_stone": ("arat_sharpening_stone", "sharpening_stone"),
+    "small_alloy_tube": ("arat_alloy_tube", "small_alloy_tube"),
+    "large_alloy_tube": ("arat_alloy_tube", "large_alloy_tube"),
+    "marble": ("arat_marble", "marble"),
+    "ball_bearing": ("arat_ball_bearing", "ball_bearing"),
+}
+# Where the object is dropped at every reset, relative to the palm link at the reset pose: a little
+# toward the fingers (world +X at both arms' reset poses), 6 cm above the tabletop.
+GRASP_OBJECT_FORWARD_M = 0.06
+GRASP_OBJECT_DROP_M = 0.06
+# With the hand lying just above the table (a `rest` start pose) the object goes beyond the fingertips
+# instead (the open hand reaches 0.20 m in front of the palm link).
+GRASP_OBJECT_FORWARD_OF_RESTING_HAND_M = 0.26
+RESTING_HAND_BELOW_M = 0.12
+
+
 def build_wrist_bench_config(
     scene: HandBenchScene,
     arm: WristBenchArm | None = None,
@@ -120,6 +148,8 @@ def build_wrist_bench_config(
     layout_name: str = CAMERA_LAYOUT,
     reset_pose: str | None = None,
     viewport_name: str | None = "Viewport",
+    assisted_grasp: bool = False,
+    grasp_object: str | None = None,
 ) -> dict:
     """Build the OmniGibson environment: the hand-bench table and the selected IK-controlled arm + Sharpa.
 
@@ -150,6 +180,19 @@ def build_wrist_bench_config(
             "orientation": list(table.orientation_xyzw),
         }
     ]
+    if grasp_object is not None:
+        category, model = GRASP_OBJECTS[grasp_object]
+        objects.append(
+            {
+                "type": "DatasetObject",
+                "name": GRASP_OBJECT_NAME,
+                "category": category,
+                "model": model,
+                "dataset_name": GRASP_OBJECT_DATASET,
+                "position": [float(table.position[0]), float(table.position[1]), 1.0],
+                "orientation": [0.0, 0.0, 0.0, 1.0],
+            }
+        )
     for light in scene.lights:
         objects.append(
             {
@@ -179,7 +222,10 @@ def build_wrist_bench_config(
             {
                 **robot_config.environment_config(),
                 "grasping_direction": "upper",
-                "grasping_mode": "physical",
+                # As in launch_og.py: assisted mode enables OmniGibson's weld machinery, the bench's
+                # AssistedGraspSupervisor makes the grasp/release decisions.
+                "grasping_mode": "assisted" if assisted_grasp else "physical",
+                "disable_grasp_handling": assisted_grasp,
                 "obs_modalities": [],
                 "action_normalize": False,
                 "fixed_base": True,
@@ -327,6 +373,49 @@ def _parser() -> argparse.ArgumentParser:
         help="Load the bench without any tracking source; the arm holds its reset pose",
     )
     parser.add_argument(
+        "--grasp-object",
+        choices=sorted(GRASP_OBJECTS),
+        default=None,
+        help="Put this ARAT object on the table under the hand (re-placed at every reset); "
+        "default with --assisted-grasp: block_5",
+    )
+    parser.add_argument(
+        "--assisted-grasp",
+        action="store_true",
+        help="Weld a grasped object to the hand with launch_og.py's assisted-grasp supervisor "
+        "(same criteria, release rule and finger freezing)",
+    )
+    parser.add_argument(
+        "--assisted-grasp-debug",
+        action="store_true",
+        help="Accepted for launch-preset compatibility; the bench records no trace but prints, once a "
+        "second, why a pending friction_closure grasp is not welding yet",
+    )
+    parser.add_argument(
+        "--assisted-grasp-weld",
+        choices=("rigid", "compliant"),
+        default="rigid",
+        help="Weld type, as in launch_og.py: rigid (default) or compliant (spring weld for small objects)",
+    )
+    parser.add_argument("--assisted-grasp-weld-stiffness", type=float, default=3000.0, metavar="N/M",
+                        help="Linear stiffness of the compliant weld (default: 3000)")
+    parser.add_argument("--assisted-grasp-weld-angular-stiffness", type=float, default=20.0, metavar="NM/RAD",
+                        help="Angular stiffness of the compliant weld (default: 20)")
+    parser.add_argument("--object-depenetration-velocity", type=float, default=3.0, metavar="M/S",
+                        help="With --assisted-grasp: PhysX depenetration velocity cap of the objects (default 3; 0.3 against flings)")
+    parser.add_argument("--assisted-grasp-window", type=float, default=0.3, metavar="S",
+                        help="Seconds the weld rule must hold before welding (default: 0.3; 0.1 for a ball bearing)")
+    parser.add_argument(
+        "--assisted-grasp-criterion",
+        choices=("contact_opposition", "friction_closure"),
+        default="contact_opposition",
+        help="Weld rule, as in launch_og.py (default: contact_opposition)",
+    )
+    parser.add_argument("--assisted-grasp-mu", type=float, default=0.5)
+    parser.add_argument("--assisted-grasp-weight-factor", type=float, default=2.0)
+    parser.add_argument("--assisted-grasp-force-floor", type=float, default=0.5, metavar="N")
+    parser.add_argument("--assisted-grasp-squeeze-delta-rad", type=float, default=0.03)
+    parser.add_argument(
         "--record-hand-poses",
         action="store_true",
         help="Accepted for launch-preset compatibility and ignored: the wrist bench never records",
@@ -385,6 +474,12 @@ def _validate_args(args, selection: TrackingSelection) -> None:
     if args.view_only:
         return
     _validate_manus_selection(args, selection)
+
+
+def _grasp_object_name(args) -> str | None:
+    if args.grasp_object is not None:
+        return args.grasp_object
+    return "block_5" if args.assisted_grasp else None
 
 
 def _selected_arm(args) -> WristBenchArm:
@@ -512,7 +607,7 @@ def vive_ultimate_preflight(
 # Simulator
 
 
-def _validate_bench(env, robot, table, scene: HandBenchScene, arm: WristBenchArm) -> None:
+def _validate_bench(env, robot, table, scene: HandBenchScene, arm: WristBenchArm, minimum_clearance: float = MINIMUM_PALM_CLEARANCE_M) -> None:
     """Assert the table height, a clear palm above the table, the expected arm, and no robot-table contact."""
 
     from omnigibson.utils.usd_utils import RigidContactAPI
@@ -546,10 +641,10 @@ def _validate_bench(env, robot, table, scene: HandBenchScene, arm: WristBenchArm
     position, _ = link.get_position_orientation()
     position = position.cpu().numpy()
     clearance = float(position[2]) - tabletop
-    if clearance < MINIMUM_PALM_CLEARANCE_M:
+    if clearance < minimum_clearance:
         raise RuntimeError(
             f"{arm.palm_link} settled {clearance * 100:.1f} cm above the tabletop at reset; expected at least "
-            f"{MINIMUM_PALM_CLEARANCE_M * 100:.0f} cm (check --reset-pose and the robot placement)"
+            f"{minimum_clearance * 100:.0f} cm (check --reset-pose and the robot placement)"
         )
     if RigidContactAPI.is_in_contact(
         scene_idx=env.scene.idx,
@@ -600,6 +695,8 @@ def run_bench(
         camera_rig_name=camera_rig_name,
         reset_pose=reset_pose,
         viewport_name=None if headless else "Viewport",
+        assisted_grasp=args.assisted_grasp,
+        grasp_object=_grasp_object_name(args),
     )
     print(
         f"\nLoading the Sharpa wrist bench (arm: {arm.key}, {arm.description}; "
@@ -613,10 +710,32 @@ def run_bench(
     if table is None:
         raise RuntimeError("Wrist bench scene did not load its table")
     reset_positions = th.tensor(reset_joint_positions(arm, reset_pose), dtype=th.float32)
+    grasp_object = env.scene.object_registry("name", GRASP_OBJECT_NAME)
 
     def hold_reset() -> None:
         robot.set_joint_positions(reset_positions)
         robot.keep_still()
+
+    def place_grasp_object() -> None:
+        """Drop the object under the hand, a little toward the fingers, onto the table."""
+        if grasp_object is None:
+            return
+        palm_position = robot.links[arm.palm_link].get_position_orientation()[0]
+        target = th.tensor(
+            [
+                float(palm_position[0])
+                + (
+                    GRASP_OBJECT_FORWARD_OF_RESTING_HAND_M
+                    if float(palm_position[2]) - scene.table.tabletop_height < RESTING_HAND_BELOW_M
+                    else GRASP_OBJECT_FORWARD_M
+                ),
+                float(palm_position[1]),
+                scene.table.tabletop_height + GRASP_OBJECT_DROP_M,
+            ],
+            dtype=th.float32,
+        )
+        grasp_object.set_position_orientation(position=target, orientation=th.tensor([0.0, 0.0, 0.0, 1.0]))
+        grasp_object.keep_still()
 
     hold_reset()
     _show_robot_end_effectors(robot)
@@ -624,7 +743,18 @@ def run_bench(
     for _ in range(10):
         hold_reset()
         og.sim.step()
-    _validate_bench(env, robot, table, scene, arm)
+    place_grasp_object()
+    for _ in range(40 if grasp_object is not None else 0):
+        hold_reset()
+        og.sim.step()
+    _validate_bench(
+        env, robot, table, scene, arm, RESTING_PALM_CLEARANCE_M if reset_pose == REST_POSE else MINIMUM_PALM_CLEARANCE_M
+    )
+    if grasp_object is not None:
+        print(
+            f"Grasp object: {_grasp_object_name(args)} ({float(grasp_object.mass):.3f} kg) at "
+            f"{[round(float(v), 3) for v in grasp_object.get_position_orientation()[0]]}; R puts it back"
+        )
     _configure_camera_layout(env, camera_rig_name, CAMERA_LAYOUT, robot)
 
     steps = 0
@@ -661,6 +791,42 @@ def run_bench(
         + f"; {arm.key} workspace: {workspace.shoulder_reach:g} m about the shoulder at "
         f"{list(workspace.shoulder_position)}, z in [{workspace.minimum_z:g}, {workspace.maximum_z:g}] m"
     )
+    grasp_supervisor = None
+    if args.assisted_grasp:
+        from dex_teleop.arat.eval.hand_model import HandSemantics
+        from dex_teleop.omnigibson.assisted_grasp import AssistedGraspConfig, AssistedGraspSupervisor
+        from dex_teleop.omnigibson.launcher import _limit_depenetration_velocity
+
+        grasp_config = AssistedGraspConfig(
+            weld_mode=args.assisted_grasp_weld,
+            grasp_window_s=args.assisted_grasp_window,
+            compliant_stiffness_n_per_m=args.assisted_grasp_weld_stiffness,
+            compliant_angular_stiffness_nm_per_rad=args.assisted_grasp_weld_angular_stiffness,
+            criterion=args.assisted_grasp_criterion,
+            friction_mu=args.assisted_grasp_mu,
+            friction_weight_factor=args.assisted_grasp_weight_factor,
+            friction_force_floor_n=args.assisted_grasp_force_floor,
+            friction_squeeze_delta_rad=args.assisted_grasp_squeeze_delta_rad,
+        )
+        grasp_supervisor = AssistedGraspSupervisor(
+            robot, HandSemantics.sharpa(args.hand), dt=1.0 / 30.0, config=grasp_config, announce=print
+        )
+        from dex_teleop.omnigibson.assisted_grasp import describe_weld
+
+        print(f"Assisted grasp criterion: {grasp_config.criterion}")
+        print(describe_weld(grasp_config))
+        _limit_depenetration_velocity(env, args.object_depenetration_velocity)
+        print(
+            f"Assisted grasping enabled (criterion: {grasp_config.criterion}"
+            + (
+                f", mu={grasp_config.friction_mu:g}, k={grasp_config.friction_weight_factor:g}, floor="
+                f"{grasp_config.friction_force_floor_n:g} N, delta={grasp_config.friction_squeeze_delta_rad:g} rad"
+                if grasp_config.criterion == "friction_closure"
+                else ""
+            )
+            + "); open the hand past its grasp posture to release"
+        )
+    last_gate_print = float("-inf")
     arm_marker_visualizer = None
     if not gm.HEADLESS:
         from dex_teleop.omnigibson.workspace_visualization import ArmPoseMarkerVisualizer
@@ -723,8 +889,11 @@ def run_bench(
         control["anchor_after"] = None
         rig["yaw_start"] = None
         _reset_and_wait_for_tracking(worker, args.initial_frame_timeout, context="Tracking was not ready for reset")
+        if grasp_supervisor is not None:
+            grasp_supervisor.reset()
         env.reset()
         hold_reset()
+        place_grasp_object()
         _show_robot_end_effectors(robot)
         rig["adapter"].request_anchor()
         if telemetry is not None:
@@ -864,13 +1033,28 @@ def run_bench(
             if control["anchor_after"] is not None:
                 control["anchor_after"] = None
                 print("Anchored: the arm now follows the tracked wrist and the fingers follow the glove")
-            action = adapter.action(snapshot)
+            action = adapter.action(
+                snapshot, frozen_fingers=None if grasp_supervisor is None else grasp_supervisor.frozen_fingers
+            )
             diagnostics = adapter.last_wrist_diagnostics
             if diagnostics is None:
                 raise RuntimeError("Sharpa adapter did not expose wrist diagnostics after building an action")
             step_started = time.monotonic()
             env.step(action)
             step_seconds = time.monotonic() - step_started
+            if grasp_supervisor is not None:
+                grasp_supervisor.step(adapter.last_live_fingers, adapter.measured_fingers)
+                gate = grasp_supervisor.diagnostic_state()["friction_gate"]
+                if gate is not None and not gate["weld"] and time.monotonic() - last_gate_print >= 1.0:
+                    last_gate_print = time.monotonic()
+                    print(
+                        "friction_closure pending: thumb pad and closure hold; "
+                        f"force thumb {gate['thumb_force_n']:.1f} N + opposing {gate['opposing_force_n']:.1f} N "
+                        f"(need {gate['required_total_force_n']:.1f} N in total) "
+                        f"{'ok' if gate['force_ok'] else 'TOO LOW'}; squeeze "
+                        + ", ".join(f"{digit} {depth:+.3f}" for digit, depth in gate["squeeze_depth_rad"].items())
+                        + (f" rad, below delta: {', '.join(gate['digits_below_delta'])}" if gate["digits_below_delta"] else " rad ok")
+                    )
             base_position, base_quaternion = _base_world_pose(robot)
             eef_position, eef_quaternion = _eef_world_pose(robot, adapter.arm_name)
             target_world = target_position_world(diagnostics.filtered_position, base_position, base_quaternion)
@@ -963,10 +1147,18 @@ def main(argv: list[str] | None = None) -> None:
                 if "manus" in (selection.hand_source, selection.wrist_source)
                 else ""
             )
+            + (f" (VIVE tracker {args.vive_tracker_id}, no glove)" if selection.wrist_source == "vive_ultimate" else "")
+            + (f" (dexemg bridge {args.dexemg_host}:{args.dexemg_port})" if selection.hand_source == "dexemg" else "")
         )
         if "manus" in selection.wrist_sources and args.manus_tracker_feed == "vive_ultimate":
             # Fail in seconds with the fix spelled out, not after the sidecar's 35 s timeout.
             print(vive_ultimate_preflight(args.vive_ultimate_socket, args.manus_expected_tracker_id))
+        if "vive_ultimate" in selection.wrist_sources:
+            print(vive_ultimate_preflight(args.vive_ultimate_socket, args.vive_tracker_id))
+        if "dexemg" in selection.articulation_sources:
+            from dex_teleop.tracking.dexemg import probe_dexemg_bridge
+
+            print(probe_dexemg_bridge(args.dexemg_host, args.dexemg_port))
     worker = None
     shutdown = GracefulShutdown()
     launcher_error: BaseException | None = None

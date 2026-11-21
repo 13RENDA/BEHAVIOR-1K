@@ -100,8 +100,118 @@ def write_action_timing_episodes(
         recording.flush()
 
 
-def merge_emg_recording(recording_path: str | Path, emg_path: str | Path) -> None:
-    """Copy a closed sidecar recording and derive per-episode EMG row ranges."""
+def _recorded_row_range(estimated_time: np.ndarray, action_timing: h5py.Group) -> tuple[int, int]:
+    """Half-open EMG row range from the first recorded action's application to the last step's return."""
+
+    first, last = None, None
+    for _episode_id, timing in _episode_groups(action_timing):
+        apply_times = np.asarray(timing["action_apply_monotonic_ns"], dtype=np.int64)
+        return_times = np.asarray(timing["step_return_monotonic_ns"], dtype=np.int64)
+        if len(apply_times) == 0:
+            continue
+        first = int(apply_times[0]) if first is None else min(first, int(apply_times[0]))
+        last = int(return_times[-1]) if last is None else max(last, int(return_times[-1]))
+    if first is None or len(estimated_time) == 0:
+        return 0, 0
+    return (
+        int(np.searchsorted(estimated_time, first, side="left")),
+        int(np.searchsorted(estimated_time, last, side="right")),
+    )
+
+
+def _copy_trimmed_emg(source: h5py.Group, recording: h5py.File, row_start: int, row_end: int) -> None:
+    """Copy the EMG group keeping sample rows [row_start, row_end) only (and the callbacks that hold them)."""
+
+    target = recording.create_group(EMG_GROUP)
+    for key, value in source.attrs.items():
+        target.attrs[key] = value
+    for name in source:
+        if name not in ("samples", "batches"):
+            source.copy(name, target)
+    total = int(source["samples/sample_index"].shape[0])
+    samples = target.create_group("samples")
+    first_rows = np.asarray(source["batches/first_sample_row"], dtype=np.int64)
+    counts = np.asarray(source["batches/sample_count"], dtype=np.int64)
+    kept = np.flatnonzero((first_rows + counts > row_start) & (first_rows < row_end)) if row_end > row_start else np.zeros(0, dtype=np.int64)
+    first_batch = int(kept[0]) if len(kept) else 0
+    for name, dataset in source["samples"].items():
+        data = dataset[row_start:row_end]
+        if name == "batch_id":
+            data = data - first_batch
+        samples.create_dataset(name, data=data, dtype=dataset.dtype, chunks=True, maxshape=(None, *dataset.shape[1:]))
+    batches = target.create_group("batches")
+    batch_slice = slice(first_batch, first_batch + len(kept))
+    for name, dataset in source["batches"].items():
+        data = dataset[batch_slice]
+        if name == "first_sample_row":
+            data = np.maximum(first_rows[batch_slice], row_start) - row_start
+        elif name == "sample_count":
+            ends = np.minimum(first_rows[batch_slice] + counts[batch_slice], row_end)
+            data = (ends - np.maximum(first_rows[batch_slice], row_start)).astype(dataset.dtype)
+        batches.create_dataset(name, data=data, dtype=dataset.dtype, chunks=True, maxshape=(None, *dataset.shape[1:]))
+    target.attrs["trimmed_to_recording"] = True
+    target.attrs["trim_semantics"] = (
+        "samples before the first recorded action (the first SPACE) and after the last recorded step were "
+        "dropped; their host times were estimated on the whole stream before the cut"
+    )
+    target.attrs["untrimmed_sample_count"] = total
+    target.attrs["trimmed_rows_before"] = int(row_start)
+    target.attrs["trimmed_rows_after"] = int(total - row_end)
+    target.attrs["sample_count"] = int(row_end - row_start)
+    target.attrs["batch_count"] = int(len(kept))
+    if row_end > row_start:
+        target.attrs["first_sample_index"] = int(samples["sample_index"][0])
+        target.attrs["estimated_first_sample_monotonic_ns"] = int(samples["estimated_monotonic_ns"][0])
+    if "fitted_segment_first_row" in source.attrs:
+        starts = np.asarray(source.attrs["fitted_segment_first_row"], dtype=np.int64)
+        ends = np.append(starts[1:], total)
+        overlap = (ends > row_start) & (starts < row_end)
+        target.attrs["fitted_segment_first_row"] = np.maximum(starts[overlap], row_start) - row_start
+        for key in ("fitted_sample_period_ns", "fitted_segment_period_measured"):
+            if key in source.attrs:
+                target.attrs[key] = np.asarray(source.attrs[key])[overlap]
+
+
+GLOVE_STREAM = "hand_tracking/articulation_streams/articulation.manus"
+
+
+def read_glove_ergonomics(recording_path: str | Path, stream: str = GLOVE_STREAM) -> dict[str, np.ndarray]:
+    """The MANUS ergonomics angles a glove teleoperation recording carries with its glove frames (bridges from
+    2026-11-16 on): the EMG decoder's training labels, for evaluating a decoder on teleoperation takes.
+
+    Returns arrays over the frames that carry them: ``capture_monotonic_ns`` (the glove frame), ``publish_time`` and
+    ``arrival_monotonic_ns`` (the ergonomics callback; consecutive frames can repeat the same ergonomics: tell them
+    apart by ``arrival_monotonic_ns``, the MANUS Integrated SDK 3.2.1 leaves the ergonomics ``publish_time`` at 0) and
+    ``angles_deg`` (n, 20) in MANUS SDK 3.2 enum order (manus_python_bridge.ERGONOMICS_ORDER), the order HandSync
+    records; dexemg's ``reindex_to_emg2pose`` turns it into the decoder's joint order.
+    """
+
+    import json
+
+    with h5py.File(recording_path, "r") as recording:
+        if stream not in recording:
+            raise KeyError(f"{recording_path}: no glove stream {stream}")
+        group = recording[stream]
+        capture = np.asarray(group["capture_monotonic_ns"], dtype=np.int64)
+        provenance = [json.loads(value.decode() if isinstance(value, bytes) else value) for value in group["provenance_json"][:]]
+    rows = [k for k, entry in enumerate(provenance) if "ergonomics_deg" in entry]
+    if not rows:
+        raise ValueError(f"{recording_path}: the glove frames carry no ergonomics (recorded before 2026-11-16?)")
+    return {
+        "capture_monotonic_ns": capture[rows],
+        "publish_time": np.asarray([provenance[k]["ergonomics_publish_time"] for k in rows], dtype=np.int64),
+        "arrival_monotonic_ns": np.asarray([provenance[k]["ergonomics_arrival_monotonic_ns"] for k in rows], dtype=np.int64),
+        "angles_deg": np.asarray([json.loads(provenance[k]["ergonomics_deg"]) for k in rows], dtype=np.float32),
+    }
+
+
+def merge_emg_recording(recording_path: str | Path, emg_path: str | Path, *, trim_to_recording: bool = False) -> None:
+    """Copy a closed sidecar recording and derive per-episode EMG row ranges.
+
+    ``trim_to_recording``: keep only the EMG between the first recorded action (the operator's first SPACE)
+    and the end of the last recorded step, like every other stream of the recording. The sidecar streams
+    from launch to exit; the samples outside that span are dropped here.
+    """
 
     recording_path = Path(recording_path)
     emg_path = Path(emg_path)
@@ -112,7 +222,14 @@ def merge_emg_recording(recording_path: str | Path, emg_path: str | Path) -> Non
             raise RuntimeError("Action timing must be written before EMG synchronization")
         if EMG_GROUP in recording:
             del recording[EMG_GROUP]
-        emg_recording.copy(EMG_GROUP, recording)
+        if trim_to_recording:
+            source = emg_recording[EMG_GROUP]
+            row_start, row_end = _recorded_row_range(
+                np.asarray(source["samples/estimated_monotonic_ns"], dtype=np.int64), recording[ACTION_TIMING_GROUP]
+            )
+            _copy_trimmed_emg(source, recording, row_start, row_end)
+        else:
+            emg_recording.copy(EMG_GROUP, recording)
         emg = recording[EMG_GROUP]
         emg.attrs["schema_version"] = EMG_SCHEMA_VERSION
 

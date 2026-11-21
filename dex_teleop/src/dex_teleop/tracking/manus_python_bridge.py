@@ -80,6 +80,16 @@ DEFAULT_TRACKER_TO_CASING_TRANSLATION = {
     "right": (-0.003, -0.058, -0.043),
 }
 SDK_PYTHON_PATH_ENVIRONMENT = "DEX_TELEOP_MANUS_PYTHON_SDK_PATH"
+# MANUS ergonomics (the glove's 20 joint angles in degrees, what HandSync records and the EMG decoder is trained on):
+# ErgonomicsData.data holds 40 floats, the left hand's 20 then the right hand's 20, each in this SDK 3.2 enum order.
+ERGONOMICS_ORDER = (
+    "ThumbCMCSpread", "ThumbCMCStretch", "ThumbMCPStretch", "ThumbIPStretch",
+    "IndexMCPSpread", "IndexMCPStretch", "IndexPIPStretch", "IndexDIPStretch",
+    "MiddleMCPSpread", "MiddleMCPStretch", "MiddlePIPStretch", "MiddleDIPStretch",
+    "RingMCPSpread", "RingMCPStretch", "RingPIPStretch", "RingDIPStretch",
+    "PinkyMCPSpread", "PinkyMCPStretch", "PinkyPIPStretch", "PinkyDIPStretch",
+)
+ERGONOMICS_ORDER_VERSION = "manus-sdk-3.2-ergonomics-side20-degrees"
 LOGGER = logging.getLogger("manus_python_bridge")
 
 
@@ -374,6 +384,8 @@ class Bridge:
         self._tracker_sequence = 0
         self._terminal_exit_code = 0
         self._topologies: dict[int, dict[str, Any]] = {}
+        # glove id -> the latest ergonomics of that glove, attached to each of its articulation messages
+        self._ergonomics: dict[int, dict[str, Any]] = {}
         self._tracker_systems: dict[str, str] = {}
         self._last_landscape_payload = ""
         self._required_glove_user_id: int | None = None
@@ -570,6 +582,7 @@ class Bridge:
             self._wrapper = self.wrapper_class()
             results = [
                 ("raw skeleton", self._wrapper.register_raw_skeleton_callback(self.on_raw_skeleton)),
+                ("ergonomics", self._wrapper.register_ergonomics_callback(self.on_ergonomics)),
                 ("landscape", self._wrapper.register_landscape_callback(self.on_landscape)),
                 ("connect", self._wrapper.register_connected_callback(self.on_connect)),
                 ("disconnect", self._wrapper.register_disconnected_callback(self.on_disconnect)),
@@ -581,6 +594,7 @@ class Bridge:
             # The extern "Python" trampolines already exist; re-point the SDK at them.
             results = [
                 ("raw skeleton", lib.CoreSdk_RegisterCallbackForRawSkeletonStream(lib.python_raw_skeleton_callback)),
+                ("ergonomics", lib.CoreSdk_RegisterCallbackForErgonomicsStream(lib.python_ergonomics_callback)),
                 ("landscape", lib.CoreSdk_RegisterCallbackForLandscapeStream(lib.python_landscape_callback)),
                 ("connect", lib.CoreSdk_RegisterCallbackForOnConnect(lib.python_connected_callback)),
                 ("disconnect", lib.CoreSdk_RegisterCallbackForOnDisconnect(lib.python_disconnected_callback)),
@@ -601,6 +615,7 @@ class Bridge:
         lib, null = self.lib, self.ffi.NULL
         for register in (
             lib.CoreSdk_RegisterCallbackForRawSkeletonStream,
+            lib.CoreSdk_RegisterCallbackForErgonomicsStream,
             lib.CoreSdk_RegisterCallbackForLandscapeStream,
             lib.CoreSdk_RegisterCallbackForOnConnect,
             lib.CoreSdk_RegisterCallbackForOnDisconnect,
@@ -1221,6 +1236,40 @@ class Bridge:
             return False
         return True
 
+    def on_ergonomics(self, stream) -> None:
+        try:
+            self._handle_ergonomics(stream)
+        except Exception as error:  # noqa: BLE001
+            self._callback_failure("on_ergonomics", error)
+
+    def _handle_ergonomics(self, stream) -> None:
+        """Keep each glove's latest ergonomics; the next articulation message of that glove carries it."""
+
+        if stream == self.ffi.NULL:
+            return
+        arrival_ns = time.monotonic_ns()
+        publish_time = int(stream.publishTime.time)
+        for index in range(int(stream.dataCount)):
+            data = stream.data[index]
+            if bool(data.isUserID):
+                continue
+            glove_id = int(data.id)
+            with self._state:
+                state = self._topologies.get(glove_id)
+                side = None if state is None else state.get("side")
+                if side not in ("left", "right"):
+                    continue
+                offset = 0 if side == "left" else 20
+                angles = [float(data.data[offset + k]) for k in range(20)]
+                if not _finite(*angles):
+                    continue
+                self._ergonomics[glove_id] = {
+                    "publish_time": publish_time,
+                    "arrival_monotonic_ns": arrival_ns,
+                    "angles_deg": angles,
+                    "order_version": ERGONOMICS_ORDER_VERSION,
+                }
+
     def on_raw_skeleton(self, stream) -> None:
         try:
             self._handle_raw_skeleton(stream)
@@ -1306,6 +1355,7 @@ class Bridge:
                     "wrist_node_id": wrist_node_id,
                     "wrist_composition": composition,
                     "tracker_pose_age_ns": tracker_pose_age_ns,
+                    **({"ergonomics": dict(self._ergonomics[glove_id])} if glove_id in self._ergonomics else {}),
                     **self.connection_fields_locked(),
                     "nodes": [
                         {

@@ -657,6 +657,9 @@ class _Lib:
                 if callback is not None:
                     callback(host)
                 return
+            ergonomics = self._callbacks.get("ergonomics")
+            if ergonomics is not None and SCENARIO != "no_ergonomics":
+                ergonomics(_ergonomics_stream(self._frame))
             stream = _Struct("SkeletonStreamInfo")
             stream.skeletonsCount = 1
             stream.publishTime.time = 987654321 + self._frame
@@ -665,6 +668,17 @@ class _Lib:
                 callback(stream)
             self._frame += 1
             self._stop.wait(period)
+
+
+def _ergonomics_stream(frame: int):
+    """ErgonomicsStream with the glove's 40 floats (left 20, right 20): right angle k = 10 + k + frame / 100, left = -1;
+    plus a user-id entry the bridge must skip."""
+
+    from types import SimpleNamespace
+
+    glove = SimpleNamespace(id=GLOVE_ID, isUserID=False, data=[-1.0] * 20 + [10.0 + k + frame / 100.0 for k in range(20)])
+    user = SimpleNamespace(id=USER_ID, isUserID=True, data=[99.0] * 40)
+    return SimpleNamespace(publishTime=SimpleNamespace(time=555000000 + frame), data=[user, glove], dataCount=2)
 
 
 lib = _Lib()

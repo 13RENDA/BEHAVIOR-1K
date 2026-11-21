@@ -60,7 +60,8 @@ tasks:
     subscale: grip
     label: Grip, Pour water from one glass to another
     layout: grip_pour_water
-    instances: {arat_box.n.01_1: arat_box, arat_cup.n.01_1: plastic_tumbler_1, arat_cup.n.01_2: plastic_tumbler_2}
+    # The water starts in the red cup on the tested (right) side, plastic_tumbler_2, and is poured into the blue one.
+    instances: {arat_box.n.01_1: arat_box, arat_cup.n.01_1: plastic_tumbler_2, arat_cup.n.01_2: plastic_tumbler_1}
   arat_grip_alloy_tube_2_5cm:
     subscale: grip
     label: Grip, Displace 2.5-cm alloy tube
@@ -75,7 +76,7 @@ tasks:
     subscale: grip
     label: Grip, Put washer over bolt
     layout: grip_washer_over_bolt
-    instances: {arat_box.n.01_1: arat_box, arat_washer.n.01_1: washer, arat_tin.n.01_1: tin_lid, arat_plank.n.01_1: plank_target_point, arat_bolt.n.01_1: bolt_target_point}
+    instances: {arat_box.n.01_1: arat_box, arat_washer.n.01_1: washer, arat_plank.n.01_1: plank_target_point, arat_bolt.n.01_1: bolt_target_point}
   arat_pinch_ball_bearing_ring:
     subscale: pinch
     label: Pinch, Ball bearing, ring finger and thumb

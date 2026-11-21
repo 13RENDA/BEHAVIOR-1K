@@ -288,3 +288,36 @@ def test_main_view_only_runs_without_the_preset_core_fields(monkeypatch, capsys)
         main(["--task", TASK, "--view-only"])
 
     assert "not applied with --view-only" in capsys.readouterr().out
+
+
+def test_assisted_grasp_criterion_is_a_preset_key(tmp_path):
+    preset = _write(
+        tmp_path,
+        "assisted_grasp: true\nassisted_grasp_criterion: friction_closure\nassisted_grasp_mu: 0.4\n"
+        "assisted_grasp_squeeze_delta_rad: 0.05\n",
+    )
+    args, _ = _parse("--config", str(preset), "--task", TASK)
+    assert (args.assisted_grasp_criterion, args.assisted_grasp_mu, args.assisted_grasp_squeeze_delta_rad) == (
+        "friction_closure",
+        0.4,
+        0.05,
+    )
+    assert _parse("--task", TASK, default_config=None)[0].assisted_grasp_criterion == "contact_opposition"
+    with pytest.raises(SystemExit):
+        _parse("--config", str(_write(tmp_path, "assisted_grasp_criterion: magic\n")), "--task", TASK)
+
+
+def test_assisted_grasp_weld_is_a_preset_key(tmp_path):
+    preset = _write(tmp_path, "assisted_grasp: true\nassisted_grasp_weld: compliant\nassisted_grasp_weld_stiffness: 2000\n")
+    args, _ = _parse("--config", str(preset), "--task", TASK)
+    assert (args.assisted_grasp_weld, args.assisted_grasp_weld_stiffness) == ("compliant", 2000.0)
+    assert args.assisted_grasp_weld_angular_stiffness == 20.0
+    assert _parse("--task", TASK, default_config=None)[0].assisted_grasp_weld == "rigid"
+    with pytest.raises(SystemExit):
+        _parse("--config", str(_write(tmp_path, "assisted_grasp_weld: glue\n")), "--task", TASK)
+
+
+def test_assisted_grasp_window_is_a_preset_key(tmp_path):
+    preset = _write(tmp_path, "assisted_grasp: true\nassisted_grasp_window: 0.1\n")
+    assert _parse("--config", str(preset), "--task", TASK)[0].assisted_grasp_window == 0.1
+    assert _parse("--task", TASK, default_config=None)[0].assisted_grasp_window == 0.3

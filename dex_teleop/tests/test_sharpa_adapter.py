@@ -283,3 +283,20 @@ def test_request_anchor_resets_the_wrist_gate():
     # offset; a step from it then tracks normally instead of being held.
     clock.act(200)
     assert clock.act(220) == pytest.approx(math.radians(20), abs=1e-3)
+
+
+def test_tracked_translation_stays_world_aligned_on_a_yawed_base():
+    """A base yawed 90 degrees (a Tianji ARAT stance): world +X is the robot's -Y."""
+
+    class YawedRobot(FakeRobot):
+        def get_position_orientation(self):
+            # the palm link at world (0.3, 0, 1) is then at (0.4, 0, 1) in the base frame, inside the clamp
+            return th.tensor([0.3, -0.4, 0.0]), th.as_tensor(rotz(90), dtype=th.float32)
+
+    config = SharpaAdapterConfig(control_hz=30.0, maximum_position_step=1.0)
+    adapter = SharpaActionAdapter(YawedRobot(), config=config, safety_config=SafetyConfig(enabled=False))
+    anchored = adapter.action(snapshot(wrist_position=[0.0, 0.0, 0.0], timestamp=0.0))
+    moved = adapter.action(snapshot(wrist_position=[0.1, 0.0, 0.05], timestamp=0.1))
+
+    # the action is a palm target in the base frame
+    assert np.allclose(moved[:3] - anchored[:3], [0.0, -0.1, 0.05], atol=1e-6)

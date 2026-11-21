@@ -410,8 +410,8 @@ lower `Content` / `Console` tab stack, so it can be selected by clicking its
 described above the left-shoulder viewport.
 
 The launcher explicitly configures and verifies every firmware filter before
-starting notifications. Its default is the 0.5 Hz HPF on, 80 Hz LPF on, 60 Hz
-notch on, and 50 Hz notch off. Use `--no-emg-hpf`, `--no-emg-lpf`, or
+starting notifications. Its default is every filter on: the 0.5 Hz HPF, the 80 Hz LPF, the 50 Hz
+and the 60 Hz notch (as HandSync records; until 2026-11-15 the 50 Hz notch was off by default). Use `--no-emg-hpf`, `--no-emg-lpf`, or
 `--emg-notch {off,50,60,both}` to select a different reproducible policy. The
 verified aggregate state is printed at startup and stored as
 `/emg.attrs['filter_configuration']`; acquisition fails instead of silently

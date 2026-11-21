@@ -1,0 +1,175 @@
+# Arms that can carry the right Sharpa hand through the ARAT tasks (launch_og.py --arm).
+# Loaded by dex_teleop.arat.arms; the robot model, palm link, controllers and adapter workspace of
+# each arm come from hand_bench.yaml wrist_bench.arms.<bench_arm>.
+schema_version: 1
+default_arm: franka
+
+arms:
+  franka:
+    bench_arm: franka
+    robot_name: franka_sharpa_right
+    # The task instances were laid out for this arm: it stands at the pose saved with each
+    # instance and starts from dex_teleop.arat.reset_poses. Nothing else is configured here.
+    placement: task_instance
+
+  tianji:
+    bench_arm: tianji
+    robot_name: tianji_sharpa_right
+    description: Tianji Marvin Pro torso, right Marvin M6-S CCS-809 arm (809 mm; 0.773 m palm reach sphere), right Sharpa hand
+    default_reset_pose: extended
+    # The robot on the floor, base frame: the 0.754 m base plate (0.082 m tall, it may slide under
+    # the table between the legs) and the torso column (it may not).
+    floor_boxes:
+      - {name: base plate, centre: [0.0, -0.006], half_size: [0.377, 0.377]}
+      - {name: torso column, centre: [0.0, -0.006], half_size: [0.054, 0.051], taller_than_table: true}
+    # Base-frame (x, y) of the welded left arm where it passes tabletop height: since 2026-11-15 it hangs
+    # beside the torso (upper arm from the shoulder at y = 0.20 to the elbow at (0, 0.29, 0.81)). It must
+    # stay off the tabletop and out of the mannequin. (At the upstream home pose it reached 0.5 m forward.)
+    fixed_points:
+      - [0.0, 0.28]
+      - [0.06, 0.28]
+      - [0.0, 0.34]
+    # The reconstructed asset has no palm camera pods; the wrist camera sensors still mount on
+    # right_hand_C_MC.
+    wrist_camera_pods: false
+    # The rig's main camera stands 0.2 m behind the Franka; turned with a Tianji stance it would
+    # look at the back of the torso. It goes on the head instead: this base-frame position is
+    # 4.5 cm in front of the head box and 11.5 cm above it, and it looks at the stance's focus.
+    head_camera:
+      sensor_name: arat_mobile_chest_camera
+      position: [0.13, -0.03, 1.50]
+
+    # Stances: where the robot stands (base_link on the floor, yaw about +Z), the start
+    # configuration there, and optionally where the apparatus stands on the table (layout: a
+    # rotation by a multiple of 90 deg about +Z through `about`, then a translation; world frame). Every start configuration is in the IK family of the wrist bench's
+    # "extended" pose: it is that pose led to the start palm pose given in the comment (palm down,
+    # fingers along the robot's +X). docs/tianji-arat.md records how each stance was chosen and
+    # what was checked. The scene cameras and the operator's frame turn with the stance yaw, the
+    # cameras about camera_focus (the centre of the work area, world), which head_camera looks at.
+    stances:
+      # The table stances. The M6 cannot work the saved layout from the Franka's side of the table:
+      # picking up and shelving there is a 0.30 m reach away from the robot, and the band in which
+      # this arm can carry the hand from table height to above the shelf is 0.15 m deep. Seen
+      # across the robot it is long enough, so table_front turns the apparatus a quarter turn on
+      # the table (layout) and the robot works along the box instead of toward it.
+      #
+      # 2026-11-15: the user does not want the apparatus turned and does not want the robot at the
+      # table's side, and supplied the 809 mm arm. The 15 box tasks are assigned to table_front_saved:
+      # the front of the table, turned 15 deg toward the box, the apparatus as saved. table_front
+      # and table_side stay defined with start configurations for the 809 mm arm (`layouts.table`
+      # below switches in one line); recordings made with the 696 mm arm no longer match the robot.
+      table_front_saved:
+        description: at the table's -X side (the Franka's side), turned 15 deg toward the box, the apparatus as saved
+        position: [-0.52, 0.1, 0.0]
+        yaw_deg: 15.0
+        # With the 809 mm arm (2026-11-15) the palm can be led along all 15 box-task paths from here
+        # (offline path check, 13 deg from the nearest joint limit); with the 696 mm arm it could not.
+        camera_focus: [0.11, -0.28, 1.25]
+        reset_poses:
+          # palm at world (-0.044, -0.281, 1.38): 0.35 m above the tabletop over the pick points; 13 deg from the nearest joint limit along the 15 paths
+          extended: [1.720545, -0.980071, -2.13324, -2.026941, 0.79145, -0.153275, -0.544547]
+          # rest (--reset-pose rest): the open hand lying palm-down 2 cm above the lid, left of the task
+          # object, the way the operator's hand lies on the table while the EMG neutral is recorded.
+          # Palm at world (0.020, -0.100, 1.099); same arm family as `extended` (led down from it).
+          # 15 deg from the nearest joint limit at rest; the palm follows all 15 paths from here, but
+          # J6 comes within 1 deg of its limit at transport height (13 deg from `extended`).
+          rest: [0.645406, -0.869077, -1.446309, -2.13189, 0.991394, 0.436856, -1.308515]
+      # Not assigned to any task since 2026-11-15 (see above).
+      table_front:
+        description: at the table's -X side (the Franka's side), the apparatus turned a quarter turn so the box stands end-on
+        position: [-0.57, 0.173, 0.0]
+        yaw_deg: 10.0
+        # Everything the task puts on the table (box with its lid, tins, planks, bolts, the task
+        # objects) is turned -90 deg about the table's centre; the table itself stays. No
+        # translation: moving the apparatus toward the robot is the same as moving the base.
+        layout:
+          yaw_deg: -90.0
+          about: [0.2415, -0.1085]
+          translation: [0.0, 0.0]
+        camera_focus: [0.07, 0.023, 1.25]
+        reset_poses:
+          # palm at world (0.069, 0.177, 1.30), over the pick points of the turned apparatus
+          extended: [0.891278, -1.764889, -1.523248, -1.616778, 1.767595, 0.037213, -0.733854]
+      table_front_cups:
+        description: 4 cm behind that place, the apparatus as saved, for the two cups
+        # Since 2026-11-18 the water starts in the red cup on the right (plastic_tumbler_2) and is poured into the blue
+        # one. From table_front's (-0.57, 0.173) the path over the red cup first came within 8.62 degrees of a joint
+        # limit (blue cup first: 11.60), and the old start, over the blue cup, hung 10.5 cm above the new pour point.
+        # From here, starting over the red cup: 14.61 degrees; from rest 8.48, as before the change.
+        position: [-0.61, 0.173, 0.0]
+        yaw_deg: 10.0
+        camera_focus: [0.004, -0.11, 1.15]
+        reset_poses:
+          # palm at world (0.004, -0.226, 1.30), over the red cup
+          extended: [-0.659902, -0.592525, 1.410417, -1.639661, -0.590543, 0.147137, 0.815938]
+          # rest: the open hand palm-down at the height of 2 cm above the lid, left of the cups; palm at world
+          # (-0.090, 0.120, 1.099) (the joint values of (-0.57, 0.173), so 4 cm nearer the operator)
+          rest: [-0.834339, -1.05693, 0.777807, -2.089145, -1.376796, 0.899254, 0.941686]
+      # Not assigned to any task (the user does not want the robot at the table's side): the first
+      # placement, with the apparatus as saved. table_front is its image under the layout's quarter
+      # turn, so the two are the same arrangement of robot and apparatus. Kept so that recordings
+      # made in it replay.
+      table_side:
+        description: at the table's -Y side, facing the ARAT box end-on (apparatus as saved)
+        position: [-0.04, -0.92, 0.0]
+        yaw_deg: 100.0
+        camera_focus: [0.11, -0.28, 1.25]
+        reset_poses:
+          # palm at world (-0.044, -0.281, 1.38), over the pick points
+          extended: [1.002676, -1.756857, -1.529126, -1.529372, 1.755871, 0.048191, -0.535098]
+      mannequin_side:
+        description: at the mannequin's front right, for the top and the back of the head
+        position: [-0.46, -0.66, 0.0]
+        yaw_deg: 45.0
+        camera_focus: [0.146, -0.108, 1.30]
+        reset_poses:
+          # palm at world (-0.012, -0.503, 1.408), in front of the mannequin's right shoulder
+          extended: [1.36739, -1.06413, -1.124813, -2.192759, 1.353695, 0.629675, -0.637271]
+        # A palm path that ends with the hand on the scoring region (world frame; x y z qx qy qz qw).
+        touches:
+          arat_gross_movement_hand_behind_head:
+            # fingertips on the right rear of the head (0.19, -0.18, 1.29), palm down, fingers along +Y
+            contact_in_palm: [0.02, 0.0, 0.175]
+            waypoints:
+              - [0.0272, -0.5311, 1.3100, 0.5, -0.5, -0.5, -0.5]
+              - [0.1900, -0.4150, 1.3100, 0.5, -0.5, -0.5, -0.5]
+              - [0.1900, -0.3550, 1.3100, 0.5, -0.5, -0.5, -0.5]
+          arat_gross_movement_hand_top_head:
+            # finger pads on the crown (0.146, -0.108, 1.416), palm down, fingers along +Y
+            contact_in_palm: [0.03, 0.0, 0.14]
+            waypoints:
+              - [0.0202, -0.4035, 1.5060, -0.5, 0.5, 0.5, 0.5]
+              - [0.1460, -0.2480, 1.5060, -0.5, 0.5, 0.5, 0.5]
+              - [0.1460, -0.2480, 1.4460, -0.5, 0.5, 0.5, 0.5]
+      mannequin_front:
+        description: in front of the mannequin, for the mouth
+        position: [-0.66, -0.472, 0.0]
+        yaw_deg: 15.0
+        camera_focus: [0.146, -0.108, 1.30]
+        reset_poses:
+          # palm at world (-0.249, -0.356, 1.165)
+          extended: [-1.003165, -1.779194, 0.96876, -2.188214, -2.116157, 0.339182, 1.345403]
+        touches:
+          arat_gross_movement_hand_mouth:
+            # finger pads on the mouth (0.065, -0.108, 1.285), palm facing +X, fingers along +Y
+            contact_in_palm: [0.03, 0.0, 0.14]
+            waypoints:
+              - [-0.2007, -0.3435, 1.2850, 0.707107, 0.0, 0.0, -0.707107]
+              - [-0.0250, -0.2480, 1.2850, 0.707107, 0.0, 0.0, -0.707107]
+              - [0.0350, -0.2480, 1.2850, 0.707107, 0.0, 0.0, -0.707107]
+
+    # Which stance a task uses: by layout group, then per-task exceptions.
+    layouts:
+      # table_front_saved: front, apparatus as saved (all 15 follow with the 809 mm arm).
+      # table_front: front, apparatus turned a quarter turn (all 15 reachable).
+      # table_side: at the table's side, apparatus as saved (all 15 reachable).
+      table: table_front_saved
+      mannequin: mannequin_side
+    task_stances:
+      # The cups stand in reach of the same place without turning anything.
+      arat_grip_pour_water: table_front_cups
+      # The face is on the far side of the head from mannequin_side.
+      arat_gross_movement_hand_mouth: mannequin_front
+    # Tasks no stance was found for (activity: reason). launch_og.py refuses them unless
+    # --allow-unreachable is given. Empty: every task has a stance that passed the checks.
+    excluded_tasks: {}

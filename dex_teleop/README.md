@@ -1,5 +1,8 @@
 # dex_teleop: Sharpa hand bench quick start
 
+> Recording teleoperation data with the EMG wristband, the glove and the Tianji arm: see
+> [`docs/data-collection.md`](docs/data-collection.md).
+
 A right Sharpa hand fixed above a table in OmniGibson (Isaac Sim 5.1). Its 22
 finger joints follow a MANUS glove (or Quest hand tracking); the wrist is held
 by the simulator, so no wrist tracker is involved. Press `B` to switch between
@@ -207,6 +210,10 @@ python dex_teleop/scripts/launch_hand_bench.py \
   --recording-path dex_teleop/outputs/recordings/session_01.hdf5
 ```
 
+While the dexemg bridge runs (EMG teleoperation, or simply to keep one owner of the band), record through it
+instead: `--emg-bridge` in place of `--emg ...` (`launch_og.py` and `launch_hand_bench.py`); see
+`docs/emg-teleop-runbook.md`, "Recording the EMG while teleoperating".
+
 ### Synchroni SDK (required for `--emg`)
 
 `setup.sh` does not install the OYMotion SDK; use our fork:
@@ -225,8 +232,8 @@ If the band does not connect or stream, consider switching to the versions: `pip
 
 `--emg` scans for `--emg-scan-ms` (5 s) and needs exactly one match: the
 `--emg-device` address or name substring, or, without the flag, the single
-`OY*`/`Sync*`/`gForce*` device. Firmware filters default to HPF on, LPF on,
-60 Hz notch (`--no-emg-hpf`, `--no-emg-lpf`, `--emg-notch 50|both|off`). The
+`OY*`/`Sync*`/`gForce*` device. Firmware filters default to all on: HPF, LPF,
+50 Hz and 60 Hz notch, as HandSync records (`--no-emg-hpf`, `--no-emg-lpf`, `--emg-notch 50|60|off`). The
 waveform monitor docks right of the main view (`--no-emg-display` to skip it);
 `--display decoder` adds the VEMG2Pose hand from the `emg2pose` checkout
 beside this repository.
@@ -287,6 +294,24 @@ pytest -q dex_teleop/tests
   troubleshooting).
 
 ## More
+
+Fingers from the wrist EMG band instead of the glove: the dexemg bridge decodes the band live and
+`--config dexemg` takes the fingers from it and the wrist from the VIVE Ultimate directly (no glove); see
+`dex_teleop/docs/emg-teleop-runbook.md`.
+
+Every assisted-grasp mode, command and parameter is listed in `dex_teleop/docs/assisted-grasp-reference.md`
+(kept current). Small objects that the assisted grasp cannot lift (marble, tubes on their pegs): `--assisted-grasp-weld
+compliant` holds the object with a spring joint instead of the rigid weld; what was measured and what is not
+verified is in `dex_teleop/docs/assisted-grasp-weld.md`.
+
+The ARAT tasks with the Tianji Marvin M6 CCS arm instead of the Franka: `launch_og.py --arm tianji`
+(or `arm: tianji` in a preset). The robot stands at its own stances from
+`dex_teleop/src/dex_teleop/arat/arms.yaml`: for every table task at the Franka's side of the table,
+with the apparatus as saved. Since 2026-11-15 the robot carries the 809 mm Marvin M6-S CCS-809 arm, which
+reaches the shelf from there (the 696 mm arm did not). The operator's frame and the cameras follow the
+stance, and recordings remember the arm, the stance and where the apparatus stood;
+`dex_teleop/docs/tianji-arat.md` has the
+reach tables, how the stances were checked and what has not been verified.
 
 Hand **and** wrist without an ARAT task: `dex_teleop/scripts/launch_wrist_bench.py`
 keeps the arm that carries the hand visible over the same table under the

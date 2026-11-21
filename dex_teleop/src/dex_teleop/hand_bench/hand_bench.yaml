@@ -112,10 +112,10 @@ wrist_bench:
         maximum_z: 1.75
       camera_rig: wrist_bench
     tianji:
-      description: Tianji Marvin Pro torso, right Marvin M6 CCS arm, right Sharpa hand on the official end flange
+      description: Tianji Marvin Pro torso, right Marvin M6-S CCS-809 arm (809 mm), right Sharpa hand on the official end flange
       robot:
-        # Built by dex_teleop/scripts/build_tianji_sharpa_right.py from the tianji_m6_ccs
-        # dual-arm model; the flange geometry and the mount are documented in
+        # Built by dex_teleop/scripts/build_tianji_sharpa_right.py from the tianji_m6_ccs_809
+        # dual-arm model (the 809 mm arms since 2026-11-15; make_tianji_m6_809_source.py); the flange geometry and the mount are documented in
         # dex_teleop/docs/tianji-m6-sharpa-mount.md (95 mm ISO 9409-1-50-4-M6 flange, pin-aligned).
         model: tianji_m6_ccs_sharpa_right
         dataset_name: omnigibson-robot-assets
@@ -127,7 +127,7 @@ wrist_bench:
         # the table's rear legs (x >= -0.225): at x = -0.63 its front edge is at -0.253. The
         # torso is centred on the table like an operator standing at it, so the right
         # shoulder (0.20 m to the right, 1.20 m up) is at world (-0.63, -0.20, 1.20); the
-        # M6's 0.70 m reach covers the rear half of the table.
+        # arm's 0.81 m reach covers the rear half of the table.
         position: [-0.63, 0.0, 0.0]
         orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
       palm_link: right_hand_C_MC
@@ -136,14 +136,20 @@ wrist_bench:
       # the tabletop, fingertips over the table centre (Pinocchio IK, see the mount note).
       # home: Tianji's upstream Marvin Pro home pose, hand forward at 0.945 m, palm inward.
       reset_poses:
-        extended: [-1.233317, -1.338584, 1.411068, -1.857169, -1.387896, 0.215559, 0.585308]
+        # (696 mm arm until 2026-11-15: [-1.233317, -1.338584, 1.411068, -1.857169, -1.387896, 0.215559, 0.585308])
+        extended: [-1.131583, -1.55489, 1.555222, -2.114454, -1.564793, 0.022198, 0.982678]
         home: [-1.7, -1.1, 1.1, -2.0, 0.37, 0.13, -0.55]
+        # rest: `extended` lowered straight down until the open hand lies palm-down 4 cm above the tabletop
+        # (palm link at 0.825 m, just above the workspace floor of 0.82 m): the posture of the operator's
+        # hand on a table while the EMG neutral is recorded.
+        rest: [-1.461512, -1.559028, 1.553601, -1.574617, -1.558305, 0.017309, 0.112889]
       default_reset_pose: extended
-      # Reach sphere about the right shoulder: 696 mm J2-to-flange plus the 30 mm flange-to-
-      # palm offset, kept inside the stretched arm; same z band over the table as the Franka.
+      # Reach sphere about the right shoulder: 809 mm J2-to-flange plus the 30 mm flange-to-
+      # palm offset, kept 66 mm inside the stretched arm as it was for the 696 mm arm (0.66);
+      # same z band over the table as the Franka.
       workspace:
         shoulder_position: [0.0, -0.2005, 1.203]
-        shoulder_reach: 0.66
+        shoulder_reach: 0.773
         minimum_z: 0.82
         maximum_z: 1.75
       camera_rig: wrist_bench_tianji

@@ -200,6 +200,27 @@ class _SelectedRoleChecks:
     and ``_wrist_keys``.
     """
 
+    def wait_for_fresh_streams(self, maximum_age: float, timeout: float) -> bool:
+        """Let the stream bookkeeping catch up after the CALLER was blocked; True once the streams are fresh.
+
+        ``check_stream_freshness`` compares the clock with the receipts this process has heard of. A caller
+        that blocked for longer than ``maximum_age`` (an assisted-grasp weld holds the control loop for
+        0.8-1.9 s on the ARAT tube, measured 2026-11-18) is behind on them, and the check would blame the
+        providers for the caller's own stall. This polls the check for up to ``timeout`` seconds, sleeping
+        in between so the receiving thread runs. False means the streams are still stale at the deadline;
+        the caller's own ``check_stream_freshness`` then raises with the usual message.
+        """
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self.check_stream_freshness(maximum_age)
+                return True
+            except SourceUnavailableError:
+                if time.monotonic() >= deadline:
+                    return False
+            time.sleep(0.005)
+
     def _role_label(self, modality: str, key: str) -> str:
         selected = (
             key == self.articulation_source
@@ -1078,6 +1099,18 @@ class MultiSourceTrackingWorker(_SelectedRoleChecks):
             )
         )
         if observation is None:
+            if self._deferred_articulation is not None:
+                # No wrist within the skew of the pending sample (it predates every wrist buffered since a
+                # reset, or the wrist stream had a gap). A newer articulation is already waiting, so control
+                # moves on to it; otherwise the pending sample would block every later one indefinitely,
+                # because deferred samples are only promoted after a publish.
+                sample, row = self._deferred_articulation
+                self._deferred_articulation = None
+                self._pending_articulation = (
+                    sample,
+                    row,
+                    time.monotonic() + self.interpolation_wait_seconds,
+                )
             return
         if (
             observation.wrist.timestamp != articulation.timestamp

@@ -1,0 +1,64 @@
+# launch_og.py / launch_wrist_bench.py preset: fingers from the wrist EMG band (dexemg decoder), wrist from
+# the VIVE Tracker Ultimate read directly from VIVE Hub for Linux. No MANUS glove is needed.
+#
+# Start, in this order (each in its own terminal):
+#   1. VIVE Hub:  cd ~/vivehub/VIVEHub-Linux && ./run-vivehub.sh        (tracker shown as tracking)
+#   2. the bridge, in the emg2pose env, band on the wrist as when recording:
+#        conda activate emg2pose
+#        python dex_teleop/scripts/dexemg_bridge.py --checkpoint <wrist checkpoint> --adapter hci0
+#      it connects to the band and records the neutral (12 s, hold still); Enter re-records it.
+#   3. the simulator, in behavior_dex:
+#        python dex_teleop/scripts/launch_wrist_bench.py --config dexemg      (hand + arm, no task)
+#        python dex_teleop/scripts/launch_og.py --config dexemg --task arat_grasp_block_10cm
+#
+# Glove on as ground truth instead (fingers still from EMG, wrist through the MANUS sidecar, the glove's own
+# fingers recorded next to the EMG ones):
+#   python dex_teleop/scripts/launch_og.py --config manus_core --hand-source dexemg --record-hand-source manus ...
+
+# --- Tracking sources ------------------------------------------------------
+hand_source: dexemg       # fingers: the dexemg bridge (wrist EMG band -> streaming decoder)
+wrist_source: vive_ultimate # wrist: the VIVE Ultimate from VIVE Hub's tracker_server, no glove
+hand: right
+
+# --- dexemg bridge ---------------------------------------------------------
+dexemg_host: 127.0.0.1
+dexemg_port: 8765
+dexemg_startup_timeout: 30.0   # s to wait for the first hand (the bridge must have its neutral)
+dexemg_stale_timeout: 1.0      # s without a hand before finger control fails
+
+# --- VIVE Tracker Ultimate (glove-free) --------------------------------------
+vive_ultimate_socket: /tmp/vut.sock
+vive_ultimate_frame: x_right_y_up_z_back
+vive_tracker_id: "FA5AG3B00121"          # this rig's Ultimate (same serial as configs/manus_core.yaml)
+# Tracker origin -> wrist joint, tracker frame (m / xyzw). null = the MANUS mount example offset used by
+# the MANUS path too; re-measure for an EMG-only mount with the wrist bench (rotate in place).
+vive_tracker_to_wrist_translation: null
+vive_tracker_to_wrist_rotation_xyzw: null
+vive_tracker_stale_timeout: 1.0
+
+# --- Retargeting and control -------------------------------------------------
+retargeter: adaptive
+# EMG hands are stamped with the time of their EMG sample and arrive 100 ms at a time; the wrist is
+# interpolated to that time.
+maximum_source_skew: 0.05
+# Decoded hands arrive 100 ms at a time and the simulator loop can take another 100 ms per step, so a hand is
+# routinely 150-250 ms old when applied (11-14: stopped at 0.253 s > 0.25 s). Allow 0.5 s and hold the pose
+# instead of aborting when one arrives later; a silent bridge still fails after dexemg_stale_timeout.
+maximum_frame_age: 0.5
+stale_frame_policy: hold
+initial_frame_timeout: 10.0
+position_sensitivity: 1.0
+# Same VIVE Hub map as configs/manus_core.yaml; re-measure with the wrist bench's Y key after a new map.
+tracking_yaw_deg: 180.0
+
+# --- Recording -------------------------------------------------------------
+record_hand_poses: true
+
+# --- Assisted grasp (optional) -----------------------------------------------
+# assisted_grasp: true
+# assisted_grasp_debug: true                  # per-step trace for scripts/analyze_assisted_grasp.py
+# assisted_grasp_criterion: contact_opposition   # or friction_closure; keep identical for glove and EMG
+# assisted_grasp_mu: 0.5                      # friction_closure parameters: tune on glove data only,
+# assisted_grasp_weight_factor: 2.0           # freeze before any EMG session
+# assisted_grasp_force_floor: 0.5
+# assisted_grasp_squeeze_delta_rad: 0.03      # provisional until tuned on glove debug traces
